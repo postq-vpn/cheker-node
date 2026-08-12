@@ -1,5 +1,6 @@
 # Enforce Unix line endings for all shell scripts
 *.sh    text eol=lf
+*.py    text eol=lf
 
 # Common text files
 *.md    text eol=lf
