@@ -10,23 +10,22 @@
 # не использовать его ключ в сторонних проектах).
 #
 # Отличия от исходного метода:
-#   1. Зонды отбираются ПО ГОРОДАМ, а не по ASN: ТСПУ ставят у оператора в
-#      конкретном регионе, и блокировка в Новосибирске ничего не говорит про
-#      Краснодар. Отбор по ASN давал случайный состав выборки - 63% всех
-#      российских зондов сидят в Москве, и регионы попадали в неё как повезёт.
+#   1. Два режима отбора зондов (TSPU_CHECK_MODE). Режим common повторяет
+#      исходный - по сетям крупных операторов. Режим geo (по умолчанию)
+#      набирает зонды ПО ГОРОДАМ: ТСПУ ставят у оператора в конкретном
+#      регионе, и блокировка в Новосибирске ничего не говорит про Краснодар,
+#      а отбор по ASN даёт случайный состав выборки - 63% всех российских
+#      зондов сидят в Москве, и регионы попадают в неё как повезёт.
 #   2. Набор зондов ФИКСИРОВАН на сутки (кэш): один и тот же список ID во всех
 #      замерах всех серверов за прогон. Иначе проценты между серверами и
-#      раундами несравнимы.
+#      прогонами несравнимы.
 #   3. Зонд, у которого сломалась своя сеть, не считается блокировкой -
-#      см. classify() и режим control.
+#      см. classify() и перепроверку промахов в cmd_check().
 #
 # Режимы:
-#   tspu_probe.py probes  <api_key> [--refresh]         - состав выборки
+#   tspu_probe.py probes   <api_key> [--refresh]        - состав выборки
 #   tspu_probe.py asnnames                              - ASN -> имя оператора
-#   tspu_probe.py control <api_key> <ip> <sni>           - какие зонды мертвы
-#   tspu_probe.py check   <api_key> <ip> <sni> [exclude] - замер по одному IP
-#
-# exclude - список ID зондов через запятую (выхлоп DOWN из режима control).
+#   tspu_probe.py check    <api_key> <ip> <sni>         - замер по одному IP
 
 import json
 import math
@@ -35,19 +34,49 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 API = "https://atlas.ripe.net/api/v2"
+
+# Контрольные цели для перепроверки промахов: заведомо доступные зарубежные
+# IP с TLS на 443. Именно зарубежные - зонд, у которого лёг весь выход за
+# границу, не годится и для проверки наших серверов.
+#
+# Список, а не одна цель, из-за платформенного лимита RIPE Atlas: больше 25
+# одновременных измерений на ОДИН адрес не пускают, причём считаются все
+# измерения всех пользователей. На самых популярных резолверах лимит выбран
+# всегда - 8.8.8.8 и 1.1.1.1 отдают "We do not allow more than 25 concurrent
+# measurements to the same target" в любой момент. Поэтому цели перебираются
+# по очереди до первой, которая пустила.
+CONTROL_TARGETS = [
+    ("9.9.9.9", "dns.quad9.net"),
+    ("208.67.222.222", "dns.opendns.com"),
+    ("94.140.14.14", "dns.adguard-dns.com"),
+    ("149.112.112.112", "dns.quad9.net"),
+]
+
+# Свою цель можно навязать через конфиг - тогда список не используется.
+_CTL_IP = os.environ.get("TSPU_CONTROL_IP", "").strip()
+_CTL_SNI = os.environ.get("TSPU_CONTROL_SNI", "").strip()
+if _CTL_IP and _CTL_SNI:
+    CONTROL_TARGETS = [(_CTL_IP, _CTL_SNI)]
 
 # Кэш отобранных зондов. Рядом с базой флота (~/.reshala_fleet), тем же
 # способом: домашний каталог того, кто запускает reshala.
 CACHE_FILE = os.path.expanduser("~/.reshala_tspu_probes.json")
 CACHE_TTL_H = float(os.environ.get("TSPU_PROBE_CACHE_TTL_H", "24"))
 
+# Как набирать выборку:
+#   geo    - по городам: видно, ГДЕ режут, но зондов больше и прогон дороже.
+#   common - по сетям крупных операторов, как в исходном censorcheck.tlab.pw:
+#            один процент на сервер, без разбивки по городам, зато втрое
+#            дешевле. Годится, когда нужен сам факт блокировки.
+CHECK_MODE = os.environ.get("TSPU_CHECK_MODE", "geo").strip().lower()
+
 # Сколько зондов берём в каждом городе и с какого количества доступных
-# зондов город вообще попадает в выборку. При квоте 3 процент по городу
-# квантуется на 33 п.п. - поэтому город это СПРАВКА о географии, а не
-# основание для вердикта (вердикт ставится по всей выборке, см. bash-модуль).
-CITY_QUOTA = int(os.environ.get("TSPU_CITY_PROBES", "3"))
+# зондов город вообще попадает в выборку. Квота задаёт и шаг процента по
+# городу: при 5 зондах это 20 п.п., при 3 - уже 33. Только для режима geo.
+CITY_QUOTA = int(os.environ.get("TSPU_CITY_PROBES", "5"))
 CITY_MIN_PROBES = int(os.environ.get("TSPU_CITY_MIN_PROBES", "5"))
 
 # Зонд относим к ближайшему городу, если он не дальше этого радиуса.
@@ -144,6 +173,15 @@ CONSUMER_ASNS = {
     35807, 51604, 39927, 41733, 48642, 60139,
 }
 
+# Режим common: сколько зондов брать в каждой операторской сети. Список и
+# числа - те же, что в исходном censorcheck.tlab.pw. По ряду ASN зондов
+# сейчас меньше, чем просят (у Мегафона AS12714 просят 4, живых 2), поэтому
+# берём сколько есть.
+RIPE_PROBE_ASNS = [
+    (3, 12389), (5, 8402), (5, 25513), (3, 8359), (3, 3216), (2, 20485),
+    (1, 25490), (1, 43727), (4, 12714), (2, 34757), (2, 29124), (2, 12768),
+]
+
 # Ошибки, которые означают "сломался сам зонд", а не "цель недоступна".
 # Такой результат выкидывается из знаменателя целиком: считать его
 # блокировкой - значит записывать в ТСПУ чужие сетевые аварии.
@@ -203,13 +241,8 @@ def fetch_ru_probes():
     return probes
 
 
-def select_probes():
-    """Отбирает по CITY_QUOTA зондов в каждом подходящем городе.
-
-    Внутри города зонды разных операторов чередуются: три зонда одного
-    Ростелекома в Омске покажут одну точку фильтрации, а не город.
-    """
-    by_city = {}
+def _usable_probes():
+    """Живые зонды, годные для замера: рабочий IPv4 и не из стойки."""
     for p in fetch_ru_probes():
         slugs = {t.get("slug") for t in p.get("tags", [])}
         if "system-ipv4-works" not in slugs:
@@ -218,6 +251,36 @@ def select_probes():
             continue
         if STRICT_GEO and "system-auto-geoip-city" in slugs:
             continue
+        yield p, slugs
+
+
+def select_probes_by_asn():
+    """Режим common: по несколько зондов в сетях крупных операторов.
+
+    Города не размечаются вовсе - в этом режиме отчёт про них и не говорит.
+    """
+    by_asn = {}
+    for p, _slugs in _usable_probes():
+        asn = p.get("asn_v4") or 0
+        by_asn.setdefault(asn, []).append({"id": p["id"], "asn": asn, "city": ""})
+
+    chosen = []
+    for want, asn in RIPE_PROBE_ASNS:
+        group = sorted(by_asn.get(asn, []), key=lambda c: c["id"])
+        chosen.extend(group[:want])
+
+    chosen.sort(key=lambda c: (c["asn"], c["id"]))
+    return chosen
+
+
+def select_probes():
+    """Режим geo: по CITY_QUOTA зондов в каждом подходящем городе.
+
+    Внутри города зонды разных операторов чередуются: три зонда одного
+    Ростелекома в Омске покажут одну точку фильтрации, а не город.
+    """
+    by_city = {}
+    for p, _slugs in _usable_probes():
         geo = (p.get("geometry") or {}).get("coordinates")
         if not geo or len(geo) < 2:
             continue
@@ -291,7 +354,7 @@ def asn_holder(asn):
 def load_cache(force=False):
     """Отобранный набор зондов из кэша, при протухании - заново.
 
-    Набор фиксируется на сутки намеренно: проценты по серверам и раундам
+    Набор фиксируется на сутки намеренно: проценты по серверам и прогонам
     сравнимы между собой, только если их меряли одни и те же зонды.
     """
     if not force and os.path.exists(CACHE_FILE):
@@ -299,7 +362,8 @@ def load_cache(force=False):
             with open(CACHE_FILE, "r", encoding="utf-8") as fh:
                 cached = json.load(fh)
             fresh = (time.time() - cached.get("generated", 0)) < CACHE_TTL_H * 3600
-            same_shape = (cached.get("quota") == CITY_QUOTA
+            same_shape = (cached.get("mode") == CHECK_MODE
+                          and cached.get("quota") == CITY_QUOTA
                           and cached.get("min_probes") == CITY_MIN_PROBES
                           and cached.get("strict_geo") == STRICT_GEO)
             if fresh and same_shape and cached.get("probes"):
@@ -307,7 +371,7 @@ def load_cache(force=False):
         except Exception:
             pass
 
-    probes = select_probes()
+    probes = select_probes_by_asn() if CHECK_MODE == "common" else select_probes()
     names = {}
     for asn in sorted({p["asn"] for p in probes if p["asn"]}):
         holder = asn_holder(asn)
@@ -316,6 +380,7 @@ def load_cache(force=False):
 
     cache = {
         "generated": time.time(),
+        "mode": CHECK_MODE,
         "quota": CITY_QUOTA,
         "min_probes": CITY_MIN_PROBES,
         "strict_geo": STRICT_GEO,
@@ -417,6 +482,21 @@ def measure(api_key, target_ip, sni, probe_ids):
     return results
 
 
+def measure_control(api_key, probe_ids):
+    """Контрольный замер: перебирает CONTROL_TARGETS до первой доступной цели.
+
+    Отказ по лимиту одновременных измерений приходит ДО создания измерения,
+    поэтому неудачная попытка не стоит кредитов.
+    """
+    last_error = "нет целей"
+    for ip, sni in CONTROL_TARGETS:
+        try:
+            return measure(api_key, ip, sni, probe_ids)
+        except RuntimeError as e:
+            last_error = str(e)
+    raise RuntimeError(last_error)
+
+
 def classify(result):
     """ok | fault | blocked для одного результата зонда.
 
@@ -442,7 +522,10 @@ def cmd_probes(api_key, force=False):
         return
     cities = {}
     for p in probes:
-        cities[p["city"]] = cities.get(p["city"], 0) + 1
+        if p.get("city"):
+            cities[p["city"]] = cities.get(p["city"], 0) + 1
+    # В режиме common городов нет вовсе - вторым числом уходит 0, и bash по
+    # нему понимает, что раздела про географию в отчёте не будет.
     print(f"OK {len(probes)} {len(cities)}")
     for city, count in sorted(cities.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f"CITY {count} {city}")
@@ -455,47 +538,37 @@ def cmd_asnnames():
         print(f"{asn}\t{name}")
 
 
-def cmd_control(api_key, ip, sni):
-    """Замер по заведомо неблокируемой цели: кто из зондов сейчас не в форме.
+def _failed_ids(results):
+    """ID зондов, которые в этом замере не достучались (fault не в счёт)."""
+    return {r.get("prb_id") for r in results
+            if r.get("prb_id") and classify(r) == "blocked"}
 
-    Всё, что не достучалось до контроля, в этом раунде выкидывается из
-    расчёта по серверам флота: такой зонд ничего не говорит про ТСПУ.
+
+def _ok_ids(results):
+    return {r.get("prb_id") for r in results
+            if r.get("prb_id") and classify(r) == "ok"}
+
+
+def cmd_check(api_key, ip, sni):
+    """Замер по одному IP с перепроверкой ТОЛЬКО промахнувшихся зондов.
+
+    Полный замер делается один раз. Если промахов нет - на этом всё, второй
+    замер не нужен и не оплачивается. Если промахи есть, по ним - и только по
+    ним - идут два маленьких замера: повтор по тому же серверу и контрольный
+    по заведомо доступной цели.
+
+    Зонд уходит в блокировку, только если промахнулся ОБА раза и при этом
+    доказал, что жив (дотянулся до контроля). Отвалившийся зонд отсеивается
+    сам собой: до контроля он тоже не дотянется, и из расчёта уйдёт целиком -
+    ни в числитель, ни в знаменатель.
     """
     probes = load_probe_set(api_key)
     if not probes:
         print("ERROR NO_PROBES")
         return
 
-    ids = [p["id"] for p in probes]
-    try:
-        results = measure(api_key, ip, sni, ids)
-    except RuntimeError as e:
-        print(f"ERROR {e}")
-        return
-
-    down = [str(r.get("prb_id")) for r in results
-            if r.get("prb_id") and classify(r) != "ok"]
-    # Зонд, который вообще промолчал, тоже не в форме.
-    answered = {r.get("prb_id") for r in results}
-    down.extend(str(i) for i in ids if i not in answered)
-
-    print(f"OK {len(ids) - len(down)} {len(ids)}")
-    if down:
-        print("DOWN " + ",".join(sorted(set(down), key=int)))
-
-
-def cmd_check(api_key, ip, sni, exclude_raw=""):
-    probes = load_probe_set(api_key)
-    if not probes:
-        print("ERROR NO_PROBES")
-        return
-
-    excluded = {int(x) for x in exclude_raw.split(",") if x.strip().isdigit()}
     meta = {p["id"]: p for p in probes}
-    ids = [p["id"] for p in probes if p["id"] not in excluded]
-    if not ids:
-        print("ERROR ALL_PROBES_DOWN")
-        return
+    ids = [p["id"] for p in probes]
 
     try:
         results = measure(api_key, ip, sni, ids)
@@ -503,49 +576,81 @@ def cmd_check(api_key, ip, sni, exclude_raw=""):
         print(f"ERROR {e}")
         return
 
-    success = blocked = fault = 0
+    ok_ids = _ok_ids(results)
+    missed = _failed_ids(results)
+    fault_n = sum(1 for r in results if classify(r) == "fault")
+
+    confirmed, noise, dead = set(), set(), set()
+    if missed:
+        retry_ids = sorted(missed)
+        # Повтор и контроль независимы - гоняем их одновременно, чтобы
+        # прогон не удлинялся на целый замер.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            again = pool.submit(measure, api_key, ip, sni, retry_ids)
+            control = pool.submit(measure_control, api_key, retry_ids)
+            try:
+                again_failed = _failed_ids(again.result())
+            except RuntimeError:
+                again_failed = set(retry_ids)
+            try:
+                control_ok = _ok_ids(control.result())
+            except RuntimeError:
+                # Контроль не удался - подтверждать живость нечем. Считаем
+                # промахи неподтверждёнными, а не блокировкой: ошибиться в
+                # сторону "доступно" здесь безопаснее.
+                control_ok = set()
+
+        for pid in missed:
+            if pid not in control_ok:
+                dead.add(pid)
+            elif pid in again_failed:
+                confirmed.add(pid)
+            else:
+                noise.add(pid)
+
+    # Молчуны (зонд не вернул результата вовсе) и fault в знаменатель не
+    # идут: они ничего не говорят ни за блокировку, ни против неё.
+    counted = ok_ids | confirmed | noise
+    total = len(counted)
+    if total == 0:
+        print(f"ERROR NO_USABLE_RESULTS:{fault_n}")
+        return
+
+    success = len(ok_ids) + len(noise)
     asn_fail = {}
     city_stat = {}          # город -> [успешно, всего]
-    city_asn_fail = {}      # город -> {ASN: сколько зондов не достучалось}
+    city_asn_fail = {}      # город -> {ASN: сколько зондов подтверждённо не дошло}
 
-    for r in results:
-        prb_id = r.get("prb_id")
-        if prb_id in excluded:
+    for pid in counted:
+        info = meta.get(pid, {})
+        city = info.get("city")
+        if not city:
             continue
-        verdict = classify(r)
-        if verdict == "fault":
-            fault += 1
-            continue
+        stat = city_stat.setdefault(city, [0, 0])
+        stat[1] += 1
+        if pid not in confirmed:
+            stat[0] += 1
 
-        info = meta.get(prb_id, {})
+    for pid in confirmed:
+        info = meta.get(pid, {})
+        asn = info.get("asn")
+        if not asn:
+            continue
+        asn_fail[asn] = asn_fail.get(asn, 0) + 1
         city = info.get("city")
         if city:
-            stat = city_stat.setdefault(city, [0, 0])
-            stat[1] += 1
-        if verdict == "ok":
-            success += 1
-            if city:
-                city_stat[city][0] += 1
-        else:
-            blocked += 1
-            asn = info.get("asn")
-            if asn:
-                asn_fail[asn] = asn_fail.get(asn, 0) + 1
-                if city:
-                    per_city = city_asn_fail.setdefault(city, {})
-                    per_city[asn] = per_city.get(asn, 0) + 1
+            per_city = city_asn_fail.setdefault(city, {})
+            per_city[asn] = per_city.get(asn, 0) + 1
 
-    total = success + blocked
-    if total == 0:
-        print(f"ERROR NO_USABLE_RESULTS:{fault}")
-        return
-
-    print(f"OK {success * 100 // total} {success} {total} {fault}")
+    print(f"OK {success * 100 // total} {success} {total} "
+          f"{fault_n} {len(dead)} {len(noise)}")
     for asn, count in sorted(asn_fail.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f"ASN {asn} {count}")
     # Имя города идёт последним полем: в нём бывает пробел ("Нижний
     # Новгород"), и в bash оно должно попасть в остаток строки целиком.
     for city, (ok_n, tot_n) in sorted(city_stat.items()):
+        if ok_n == tot_n:
+            continue
         failed = city_asn_fail.get(city, {})
         asns = ",".join(str(a) for a, _ in
                         sorted(failed.items(), key=lambda kv: (-kv[1], kv[0]))) or "-"
@@ -566,11 +671,8 @@ def main():
         if mode == "asnnames":
             cmd_asnnames()
             return
-        if mode == "control" and len(args) >= 4:
-            cmd_control(args[1], args[2], args[3])
-            return
         if mode == "check" and len(args) >= 4:
-            cmd_check(args[1], args[2], args[3], args[4] if len(args) > 4 else "")
+            cmd_check(args[1], args[2], args[3])
             return
     except Exception as e:
         print(f"ERROR UNEXPECTED:{type(e).__name__}")

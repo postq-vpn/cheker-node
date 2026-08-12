@@ -25,17 +25,10 @@ _CENSORCHECK_CRON_FILE="/etc/cron.d/reshala-censorcheck"
 _TSPU_PROBE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_probe.py"
 
 # Сколько проверок в день считаем нормой. Дальше добавлять можно, но со
-# спросом: каждый прогон создаёт _CENSORCHECK_ROUNDS измерений RIPE Atlas на
-# КАЖДЫЙ сервер флота плюс _CENSORCHECK_ROUNDS контрольных (кредиты не
-# бесконечные, см. _skynet_censorcheck_probe_set_menu) и присылает ещё одно
-# сообщение в Telegram.
+# спросом: каждый прогон создаёт измерение RIPE Atlas на КАЖДЫЙ сервер флота
+# (кредиты не бесконечные, см. _skynet_censorcheck_probe_set_menu) и
+# присылает ещё одно сообщение в Telegram.
 _CENSORCHECK_SOFT_LIMIT=4
-
-# Сколько замеров подряд делать по каждому серверу за один прогон. Вердикт
-# ставится по большинству (см. _skynet_tspu_summarize_server): чтобы уехать
-# в "Заблокировано", сервер должен недобрать проценты минимум в двух замерах.
-# Меньше трёх смысла не имеет - подтверждать промах будет нечем.
-_CENSORCHECK_ROUNDS="${TSPU_PROBE_ROUNDS:-3}"
 
 # sslcert-измерение стоит 10 кредитов RIPE Atlas за каждый ответивший зонд.
 # Нужно, чтобы показать цену прогона до того, как её увидят по факту
@@ -70,6 +63,22 @@ declare -A _TSPU_ASN_NAMES=(
 # Экранирует спецсимволы HTML в тексте, который подставляется внутрь
 # <b>/<blockquote> и т.п. (имена серверов из базы флота вводит сам
 # пользователь и не должны ломать разметку сообщения).
+# Русское склонение при числе: 1 зонд, 2 зонда, 5 зондов, 11 зондов.
+_skynet_censorcheck_plural() {
+    local n="$1" one="$2" few="$3" many="$4"
+    local n100=$(( n % 100 )) n10=$(( n % 10 ))
+
+    if [[ "$n100" -ge 11 && "$n100" -le 14 ]]; then
+        printf '%s' "$many"
+    elif [[ "$n10" -eq 1 ]]; then
+        printf '%s' "$one"
+    elif [[ "$n10" -ge 2 && "$n10" -le 4 ]]; then
+        printf '%s' "$few"
+    else
+        printf '%s' "$many"
+    fi
+}
+
 _skynet_censorcheck_html_escape() {
     local s="$1"
     s="${s//&/&amp;}"
@@ -230,23 +239,27 @@ _skynet_censorcheck_configure_ripe() {
 # обычными переменными оболочки (без export), а питон читает их из
 # окружения - поэтому пробрасываем здесь, а не засоряем конфиг экспортами.
 _skynet_tspu_py() {
-    TSPU_CITY_PROBES="${TSPU_CITY_PROBES:-3}" \
+    TSPU_CHECK_MODE="${TSPU_CHECK_MODE:-geo}" \
+    TSPU_CITY_PROBES="${TSPU_CITY_PROBES:-5}" \
     TSPU_CITY_MIN_PROBES="${TSPU_CITY_MIN_PROBES:-5}" \
     TSPU_PROBE_STRICT_GEO="${TSPU_PROBE_STRICT_GEO:-0}" \
+    TSPU_CONTROL_IP="${TSPU_CONTROL_IP:-}" \
+    TSPU_CONTROL_SNI="${TSPU_CONTROL_SNI:-}" \
     python3 "$_TSPU_PROBE_SCRIPT" "$@"
 }
 
-# ОДИН замер по IP. Печатает МНОГОСТРОЧНЫЙ блок:
-#   OK <percent> <success> <total> <fault>
-#   ASN <asn> <сколько зондов не достучалось>       (0..N строк)
-#   CITY <успешно> <всего> <asn,asn|-> <город>      (0..N строк)
+# Замер по одному IP. Печатает МНОГОСТРОЧНЫЙ блок:
+#   OK <percent> <success> <total> <fault> <dead> <noise>
+#   ASN <asn> <сколько зондов подтверждённо не дошло>   (0..N строк)
+#   CITY <успешно> <всего> <asn,asn|-> <город>          (0..N строк)
 # либо одну строку:
 #   SKIP <причина>
 #
-# exclude - ID зондов через запятую, которые в этом раунде не прошли
-# контрольный замер (см. _skynet_tspu_control_round).
+# Перепроверка промахов живёт внутри tspu_probe.py: полный замер делается
+# один раз, а повтор и контроль идут только по тем зондам, которые
+# промахнулись. Поэтому здесь никаких раундов больше нет.
 _skynet_tspu_probe_once() {
-    local ip="$1" sni="$2" api_key="$3" exclude="${4:-}"
+    local ip="$1" sni="$2" api_key="$3"
 
     # Без реально слушающего 443 RIPE Atlas всё равно покажет "заблокировано"
     # для всех зондов - но это не ТСПУ, а просто отсутствие VPN на сервере.
@@ -257,7 +270,7 @@ _skynet_tspu_probe_once() {
     fi
 
     local py_out
-    py_out=$(_skynet_tspu_py check "$api_key" "$ip" "$sni" "$exclude" 2>/dev/null)
+    py_out=$(_skynet_tspu_py check "$api_key" "$ip" "$sni" 2>/dev/null)
 
     if [[ -z "$py_out" ]] || [[ "$py_out" == ERROR* ]]; then
         local reason; reason=$(echo "$py_out" | grep "^ERROR" | head -1)
@@ -273,156 +286,83 @@ _skynet_tspu_probe_once() {
     echo "$py_out"
 }
 
-# Контрольный замер раунда: ТЕ ЖЕ зонды бьют в заведомо неблокируемую цель.
-# Печатает ID зондов через запятую, которые сейчас не в форме.
+# Итог по одному серверу. Читает <tmp_dir>/<idx>.out, оставленный
+# _skynet_tspu_probe_once, и печатает:
+#   AVAILABLE|BLOCKED|SKIP <детали>              - ровно одна первая строка
+#   CITY <промахов> <процент> <asn,asn|-> <город> - 0..N, только проблемные
 #
-# Зачем: зонды RIPE живут в домашних сетях и отваливаются сами по себе, а
-# отвалившийся зонд внешне неотличим от зарезанного ТСПУ. Тот, кто не смог
-# дотянуться даже до контрольной цели, в этом раунде не считается вообще -
-# ни в числителе, ни в знаменателе. Замер ОДИН на раунд, а не на сервер,
-# поэтому его цена не зависит от размера флота.
-_skynet_tspu_control_round() {
-    local api_key="$1"
-    local ip="${TSPU_CONTROL_IP:-8.8.8.8}"
-    local sni="${TSPU_CONTROL_SNI:-dns.google}"
-
-    local out
-    out=$(_skynet_tspu_py control "$api_key" "$ip" "$sni" 2>/dev/null)
-
-    # Контроль не удался - работаем без отсева, как до его появления.
-    if [[ -z "$out" || "$out" == ERROR* ]]; then
-        log "CensorCheck: контрольный замер не удался (${out:-нет ответа}), раунд без отсева зондов."
-        return
-    fi
-
-    echo "$out" | sed -n 's/^DOWN //p' | head -1
-}
-
-# Итог по одному серверу за все раунды прогона. Читает файлы
-# <tmp_dir>/<idx>.r<N>, оставленные _skynet_tspu_probe_once. Печатает:
-#   AVAILABLE|BLOCKED|SKIP <детали>                 - ровно одна первая строка
-#   CITY <промахов> <процент> <asn,asn|-> <город>   - 0..N, только проблемные
-#
-# Почему не один замер: зонды RIPE Atlas живут в реальных домашних сетях и
-# отваливаются сами по себе - разовый недобор процентов это чаще шум, чем
-# ТСПУ. В "Заблокировано" уезжает только то, что повторилось минимум в двух
-# замерах; одиночный промах остаётся в "Доступно" с пометкой.
+# Подтверждение промаха живёт в tspu_probe.py: сюда приходят уже только те
+# зонды, которые не достучались ДВАЖДЫ и при этом доказали, что живы. Поэтому
+# здесь никакого усреднения по раундам нет - одного подтверждённого промаха
+# достаточно, чтобы назвать сервер заблокированным.
 _skynet_tspu_summarize_server() {
     local tmp_dir="$1" idx="$2"
-    local rounds="$_CENSORCHECK_ROUNDS"
+    local file="${tmp_dir}/${idx}.out"
 
-    local -a percents=()
-    local -A asn_rounds=()      # ASN -> в скольких замерах он резал трафик
-    local -A city_ok=() city_tot=() city_miss=() city_asns=()
-    local measured=0 misses=0 last_skip=""
-    local r file head_line ln
+    [[ -s "$file" ]] || { echo "SKIP замер не выполнялся"; return; }
 
-    for ((r = 1; r <= rounds; r++)); do
-        file="${tmp_dir}/${idx}.r${r}"
-        [[ -s "$file" ]] || continue
-
-        head_line=$(head -1 "$file")
-        if [[ "${head_line%% *}" != "OK" ]]; then
-            last_skip="${head_line#SKIP }"
-            continue
-        fi
-
-        local _tag percent success total fault
-        read -r _tag percent success total fault <<< "$head_line"
-        measured=$((measured + 1))
-        percents+=("$percent")
-        [[ "$percent" -lt 100 ]] && misses=$((misses + 1))
-
-        while IFS= read -r ln; do
-            case "$ln" in
-                "ASN "*)
-                    local _a asn cnt
-                    read -r _a asn cnt <<< "$ln"
-                    asn_rounds[$asn]=$(( ${asn_rounds[$asn]:-0} + 1 ))
-                    ;;
-                "CITY "*)
-                    local _c c_ok c_tot c_asns c_name
-                    read -r _c c_ok c_tot c_asns c_name <<< "$ln"
-                    [[ -n "$c_name" ]] || continue
-                    city_ok["$c_name"]=$(( ${city_ok["$c_name"]:-0} + c_ok ))
-                    city_tot["$c_name"]=$(( ${city_tot["$c_name"]:-0} + c_tot ))
-                    if [[ "$c_ok" -lt "$c_tot" ]]; then
-                        city_miss["$c_name"]=$(( ${city_miss["$c_name"]:-0} + 1 ))
-                        [[ "$c_asns" != "-" ]] && city_asns["$c_name"]+="${c_asns},"
-                    fi
-                    ;;
-            esac
-        done < "$file"
-    done
-
-    if [[ "$measured" -eq 0 ]]; then
-        echo "SKIP ${last_skip:-ни один из ${rounds} замеров не удался}"
+    local head_line; head_line=$(head -1 "$file")
+    if [[ "${head_line%% *}" != "OK" ]]; then
+        echo "${head_line}"
         return
     fi
 
-    local sum=0 p
-    for p in "${percents[@]}"; do sum=$((sum + p)); done
-    local avg=$(( sum / measured ))
+    local _tag percent success total fault dead noise
+    read -r _tag percent success total fault dead noise <<< "$head_line"
 
-    local seq; seq=$(printf '%s%%/' "${percents[@]}"); seq="${seq%/}"
-    local partial=""
-    [[ "$measured" -lt "$rounds" ]] && partial=" · удалось ${measured} из ${rounds} замеров"
+    local blocked=$(( total - success ))
 
-    local verdict=""
-    if [[ "$misses" -eq 0 ]]; then
-        verdict="AVAILABLE${partial:+ ${partial# · }}"
-    elif [[ "$misses" -lt 2 && "$measured" -lt 2 ]]; then
-        # Одиночный промах при единственном удавшемся замере подтвердить нечем -
-        # это не "доступно" и не "заблокировано", а повод посмотреть руками.
-        verdict="SKIP единственный удавшийся замер показал ${avg}% доступности, остальные не удались (${last_skip})"
-    elif [[ "$misses" -lt 2 ]]; then
-        verdict="AVAILABLE промах в 1 замере из ${measured} (${seq}) — считаем случайным${partial}"
+    # Что осталось за кадром процента: зонды со своей сетевой аварией и
+    # отвалившиеся между замерами. Говорим об этом, только когда выборка
+    # просела заметно - иначе это одинаковый хвост у каждой строки отчёта.
+    local aside=$(( fault + dead ))
+    local note=""
+    if [[ "$aside" -gt 0 && $(( aside * 100 / (total + aside) )) -ge 20 ]]; then
+        note=" · в расчёт пошло ${total} $(_skynet_censorcheck_plural "$total" зонд зонда зондов) из $(( total + aside ))"
+    fi
+
+    if [[ "$blocked" -eq 0 ]]; then
+        echo "AVAILABLE${note:+ ${note# · }}"
     else
-        # В список блокирующих операторов пускаем только тех, кто повторился:
-        # ASN, мелькнувший в одном замере из трёх, - такой же шум, как и сам промах.
-        local blockers="" cnt name sorted asn
+        local blockers="" cnt name asn sorted
         sorted=$(
-            for asn in "${!asn_rounds[@]}"; do
-                [[ "${asn_rounds[$asn]}" -ge 2 ]] || continue
-                printf '%s\t%s\n' "${asn_rounds[$asn]}" "${_TSPU_ASN_NAMES[$asn]:-AS$asn}"
-            done | sort -k1,1nr -k2,2
+            while read -r _tag asn cnt; do
+                [[ -n "$asn" ]] || continue
+                printf '%s	%s
+' "$cnt" "${_TSPU_ASN_NAMES[$asn]:-AS$asn}"
+            done < <(grep '^ASN ' "$file") | sort -k1,1nr -k2,2
         )
-        while IFS=$'\t' read -r cnt name; do
+        while IFS=$'	' read -r cnt name; do
             [[ -n "$name" ]] || continue
-            blockers+="${name}(${cnt}/${measured}), "
+            blockers+="${name}(${cnt}), "
         done <<< "$sorted"
         blockers="${blockers%, }"
 
-        verdict="BLOCKED доступно в среднем ${avg}% (замеры: ${seq})${blockers:+, блокируют: ${blockers}}${partial}"
+        echo "BLOCKED доступно ${percent}% (${success}/${total})${blockers:+, блокируют: ${blockers}}${note}"
     fi
 
-    echo "$verdict"
-
-    # Город идёт в отчёт по тому же правилу, что и сам сервер: промах должен
-    # повториться минимум в двух замерах. При квоте 3 зонда на город один
-    # выпавший зонд это сразу 33 п.п. - без этого правила отчёт будет пестреть
-    # случайными городами.
-    local c pct uniq
-    for c in "${!city_miss[@]}"; do
-        [[ "${city_miss[$c]}" -ge 2 ]] || continue
-        pct=0
-        [[ "${city_tot[$c]:-0}" -gt 0 ]] && pct=$(( ${city_ok[$c]} * 100 / ${city_tot[$c]} ))
-        uniq=$(printf '%s' "${city_asns[$c]%,}" | tr ',' '\n' | sort -un | tr '\n' ',')
-        uniq="${uniq%,}"
-        echo "CITY ${city_miss[$c]} ${pct} ${uniq:--} ${c}"
-    done | sort -t' ' -k3,3n
+    # Города python отдаёт уже отфильтрованными - только те, где есть
+    # подтверждённые промахи. Пересчитываем в проценты и сортируем по
+    # тяжести, худшие сверху.
+    local _c c_ok c_tot c_asns c_name c_pct
+    while read -r _c c_ok c_tot c_asns c_name; do
+        [[ -n "$c_name" ]] || continue
+        c_pct=0
+        [[ "$c_tot" -gt 0 ]] && c_pct=$(( c_ok * 100 / c_tot ))
+        echo "CITY $(( c_tot - c_ok )) ${c_pct} ${c_asns} ${c_name}"
+    done < <(grep '^CITY ' "$file") | sort -t' ' -k3,3n
 }
 
 # Прогоняет весь флот (без SSH, напрямую по IP из базы флота). Результаты -
 # в файлах внутри временной директории, путь к которой печатает в stdout:
 #   <tmp_dir>/N.name   - "Имя (IP)"
-#   <tmp_dir>/N.r<R>   - сырой выхлоп замера сервера N в раунде R
+#   <tmp_dir>/N.out    - сырой выхлоп замера сервера N
 #   <tmp_dir>/N.result - вердикт + строки CITY (см. _skynet_tspu_summarize_server)
 #   <tmp_dir>/.count   - количество серверов N
 #
-# Раунды идут ПОСЛЕДОВАТЕЛЬНО, серверы внутри раунда - ПАРАЛЛЕЛЬНО. Порядок
-# именно такой из-за контрольного замера: он общий на раунд, и его результат
-# нужен всем серверам этого раунда до начала их замеров.
+# Серверы идут ПАРАЛЛЕЛЬНО, по одному замеру на сервер: перепроверка промахов
+# спрятана внутрь tspu_probe.py и тратит замеры только на те зонды, которым
+# есть что подтверждать.
 _skynet_tspu_check_fleet_parallel() {
     local sni="$1" api_key="$2"
     local tmp_dir; tmp_dir=$(mktemp -d)
@@ -433,31 +373,24 @@ _skynet_tspu_check_fleet_parallel() {
         [[ -n "$line" ]] && lines+=("$line")
     done < "$FLEET_DATABASE_FILE"
 
-    local -a ips=()
+    local -a pids=()
     local i=0 name user ip port key_path sudo_pass
     for line in "${lines[@]}"; do
         IFS='|' read -r name user ip port key_path sudo_pass <<< "$line"
         [[ -z "$name" ]] && continue
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
-        ips+=("$ip")
+        ( _skynet_tspu_probe_once "$ip" "$sni" "$api_key" > "${tmp_dir}/${i}.out" ) &
+        pids+=("$!")
     done
+
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        wait "${pids[@]}" 2>/dev/null
+    fi
+
     echo "$i" > "${tmp_dir}/.count"
 
-    local r idx dead
-    for ((r = 1; r <= _CENSORCHECK_ROUNDS; r++)); do
-        dead=$(_skynet_tspu_control_round "$api_key")
-        [[ -n "$dead" ]] && printf '%s' "$dead" > "${tmp_dir}/.dead.${r}"
-
-        local -a pids=()
-        for ((idx = 1; idx <= i; idx++)); do
-            ( _skynet_tspu_probe_once "${ips[$((idx - 1))]}" "$sni" "$api_key" "$dead" \
-                > "${tmp_dir}/${idx}.r${r}" ) &
-            pids+=("$!")
-        done
-        [[ ${#pids[@]} -gt 0 ]] && wait "${pids[@]}" 2>/dev/null
-    done
-
+    local idx
     for ((idx = 1; idx <= i; idx++)); do
         _skynet_tspu_summarize_server "$tmp_dir" "$idx" > "${tmp_dir}/${idx}.result"
     done
@@ -520,10 +453,19 @@ _skynet_censorcheck_run_and_report() {
     local -a all_cities=()
     mapfile -t all_cities < <(echo "$probes_out" | sed -n 's/^CITY [0-9]* //p')
 
+    # В режиме common городов нет: и строка о выборке, и раздел с географией
+    # в отчёте отличаются только этим.
+    local sample_line="${probe_n} $(_skynet_censorcheck_plural "$probe_n" зонд зонда зондов)"
+    if [[ "$city_n" -gt 0 ]]; then
+        sample_line+=" в ${city_n} $(_skynet_censorcheck_plural "$city_n" городе городах городах)"
+    else
+        sample_line+=" в сетях крупных операторов"
+    fi
+
     if [[ "$verbose" -eq 1 ]]; then
         printf_info "Проверяю доступность всех серверов флота из сетей РФ (RIPE Atlas, параллельно)."
-        printf_info "Выборка: ${probe_n} зондов в ${city_n} городах, ${_CENSORCHECK_ROUNDS} замера на сервер."
-        printf_info "Каждый раунд начинается с контрольного замера — это займёт несколько минут."
+        printf_info "Выборка: ${sample_line}, по одному замеру на сервер."
+        printf_info "Промахи перепроверяются отдельно — это займёт пару минут."
     fi
 
     local tmp_dir; tmp_dir=$(_skynet_tspu_check_fleet_parallel "$sni" "$RIPE_API_KEY")
@@ -610,7 +552,7 @@ _skynet_censorcheck_run_and_report() {
     done
     clean_list="${clean_list%, }"
 
-    local report="<tg-emoji emoji-id=\"5474410313853998290\">💡</tg-emoji> <b>Блокировка ТСПУ — отчёт по флоту</b>"$'\n\n'"<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Замеров на сервер: ${_CENSORCHECK_ROUNDS}, вердикт по большинству</i>"$'\n'"<i>Выборка: ${probe_n} зондов в ${city_n} городах</i>"$'\n'
+    local report="<tg-emoji emoji-id=\"5474410313853998290\">💡</tg-emoji> <b>Блокировка ТСПУ — отчёт по флоту</b>"$'\n\n'"<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
 
     if [[ -n "$ok_list" ]]; then
         report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Доступно (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
@@ -632,7 +574,7 @@ _skynet_censorcheck_run_and_report() {
         report+="</blockquote>"$'\n'
     fi
 
-    report+=$'\n'"Итого: ${total} серверов · ${blocked_n} заблокировано · ${skip_n} пропущено"
+    report+=$'\n'"Итого: ${total} $(_skynet_censorcheck_plural "$total" сервер сервера серверов) · ${blocked_n} заблокировано · ${skip_n} пропущено"
 
     if _skynet_censorcheck_tg_send "$report"; then
         [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено)."
@@ -763,8 +705,8 @@ _skynet_censorcheck_add_time() {
     if (( ${#times[@]} >= _CENSORCHECK_SOFT_LIMIT )); then
         echo ""
         printf_warning "Сейчас проверок в день: ${#times[@]}."
-        printf_description "Каждый прогон — ${_CENSORCHECK_ROUNDS} измерения RIPE Atlas на каждый сервер"
-        printf_description "флота и ещё одно сообщение в Telegram. Норма — 3-4 раза в день."
+        printf_description "Каждый прогон — измерение RIPE Atlas на каждый сервер флота"
+        printf_description "и ещё одно сообщение в Telegram. Норма — 3-4 раза в день."
         echo ""
         ask_yes_no "Всё равно добавить ${new} МСК?" "n" || return
     fi
@@ -827,16 +769,29 @@ _skynet_censorcheck_times_inline() {
     printf '%s МСК' "${joined%, }"
 }
 
-# Состав выборки: какие города проверяются, сколько это стоит за прогон и
-# кнопка пересобрать набор зондов, не дожидаясь суточного протухания кэша.
+# Режим проверки и состав выборки: что проверяется, сколько это стоит за
+# прогон и кнопка пересобрать набор зондов, не дожидаясь суточного
+# протухания кэша.
 _skynet_censorcheck_probe_set_menu() {
     while true; do
         clear
-        menu_header "🛰 Выборка зондов по городам"
-        printf_description "Зонды набираются по городам: ТСПУ ставят у оператора в"
-        printf_description "конкретном регионе, и блокировка в Новосибирске ничего не"
-        printf_description "говорит про Краснодар. Набор фиксируется на сутки — иначе"
-        printf_description "проценты разных серверов и раундов несравнимы между собой."
+        menu_header "🛰 Режим проверки и выборка зондов"
+
+        local mode="${TSPU_CHECK_MODE:-geo}"
+        if [[ "$mode" == "common" ]]; then
+            printf_description "Режим: ${C_GREEN}общая проверка${C_RESET}"
+            printf_description "Зонды берутся в сетях крупных операторов, как в исходном"
+            printf_description "censorcheck.tlab.pw. В отчёте — один процент на сервер и"
+            printf_description "список операторов, без разбивки по городам. Дешевле."
+        else
+            printf_description "Режим: ${C_GREEN}проверка по географии${C_RESET}"
+            printf_description "Зонды берутся по городам: ТСПУ ставят у оператора в"
+            printf_description "конкретном регионе, и блокировка в Новосибирске ничего не"
+            printf_description "говорит про Краснодар. В отчёте — раздел «География"
+            printf_description "блокировок» с городами и операторами. Зондов больше."
+        fi
+        printf_description "Набор фиксируется на сутки — иначе проценты разных"
+        printf_description "серверов несравнимы между собой."
         echo ""
 
         if [[ -z "${RIPE_API_KEY:-}" ]]; then
@@ -855,39 +810,63 @@ _skynet_censorcheck_probe_set_menu() {
         local _p probe_n city_n
         read -r _p probe_n city_n <<< "$(echo "$out" | head -1)"
 
-        printf_description "Зондов: ${C_GREEN}${probe_n}${C_RESET} в ${C_GREEN}${city_n}${C_RESET} городах"
-        printf_description "  (по ${TSPU_CITY_PROBES:-3} на город, город берётся от ${TSPU_CITY_MIN_PROBES:-5} доступных зондов)"
+        if [[ "$city_n" -gt 0 ]]; then
+            printf_description "Зондов: ${C_GREEN}${probe_n}${C_RESET} в ${C_GREEN}${city_n}${C_RESET} городах"
+            printf_description "  (по ${TSPU_CITY_PROBES:-5} на город, город берётся от ${TSPU_CITY_MIN_PROBES:-5} доступных зондов)"
+            echo ""
+
+            local cnt city
+            while read -r _p cnt city; do
+                [[ -n "$city" ]] || continue
+                printf_description "  • ${city} — ${cnt}"
+            done < <(echo "$out" | grep '^CITY ')
+        else
+            printf_description "Зондов: ${C_GREEN}${probe_n}${C_RESET} в сетях крупных операторов"
+        fi
         echo ""
 
-        local cnt city
-        while read -r _p cnt city; do
-            [[ -n "$city" ]] || continue
-            printf_description "  • ${city} — ${cnt}"
-        done < <(echo "$out" | grep '^CITY ')
-        echo ""
-
-        # Прикидка по кредитам: замеры по флоту плюс контрольный замер, один
-        # на раунд независимо от размера флота.
+        # Прикидка по кредитам считается по чистому прогону, без блокировок:
+        # перепроверка тратится только на промахнувшиеся зонды, и на спокойном
+        # флоте её просто нет. При реальной блокировке добавится по два
+        # маленьких замера на каждый промахнувшийся зонд.
         local fleet_n=0
         [[ -s "$FLEET_DATABASE_FILE" ]] && fleet_n=$(grep -c . "$FLEET_DATABASE_FILE")
         local per_msm=$(( probe_n * _CENSORCHECK_CREDITS_PER_PROBE ))
-        local per_run=$(( per_msm * _CENSORCHECK_ROUNDS * (fleet_n + 1) ))
+        local per_run=$(( per_msm * fleet_n ))
         local runs; runs=$(_skynet_censorcheck_times | grep -c .)
 
         printf_description "Цена прогона: ${C_YELLOW}${per_run}${C_RESET} кредитов RIPE Atlas"
-        printf_description "  (${probe_n} зондов × 10 × ${_CENSORCHECK_ROUNDS} замера × ${fleet_n} серверов + контроль)"
+        printf_description "  (${probe_n} зондов × 10 × ${fleet_n} серверов, без блокировок)"
         if [[ "$runs" -gt 0 ]]; then
             printf_description "В сутки при ${runs} прогонах: ${C_YELLOW}$(( per_run * runs ))${C_RESET} кредитов"
             printf_description "  (свой зонд RIPE Atlas приносит 21600 кредитов в сутки)"
         fi
         echo ""
 
+        if [[ "$mode" == "common" ]]; then
+            printf_menu_option "m" "Переключить на проверку по географии"
+        else
+            printf_menu_option "m" "Переключить на общую проверку"
+        fi
         printf_menu_option "u" "Пересобрать набор зондов сейчас"
         printf_menu_option "b" "Назад"
         echo ""
 
         local choice; choice=$(safe_read "Выбор: " "") || { _LAST_CTRLC_SIGNALED=0; continue; }
         case "$choice" in
+            [mM])
+                # Набор зондов у режимов разный, поэтому кэш пересобирается
+                # сразу же — иначе до конца суток проверка шла бы старым
+                # набором, а отчёт обещал бы новый режим.
+                local new_mode="common"
+                [[ "$mode" == "common" ]] && new_mode="geo"
+                set_config_var "TSPU_CHECK_MODE" "$new_mode"
+                TSPU_CHECK_MODE="$new_mode"
+                printf_info "Пересобираю набор под новый режим..."
+                _skynet_tspu_py probes "$RIPE_API_KEY" --refresh >/dev/null 2>&1 \
+                    && printf_ok "Готово." || printf_error "Не удалось пересобрать набор."
+                sleep 1
+                ;;
             [uU])
                 printf_info "Пересобираю набор (опрос RIPE Atlas и имён операторов)..."
                 if _skynet_tspu_py probes "$RIPE_API_KEY" --refresh >/dev/null 2>&1; then
@@ -908,7 +887,7 @@ _skynet_censorcheck_schedule_menu() {
         clear
         menu_header "🗓 Расписание проверок ТСПУ"
         printf_description "Каждый пункт расписания — отдельный прогон по всему флоту"
-        printf_description "(${_CENSORCHECK_ROUNDS} замера на сервер, вердикт по большинству) с отдельным"
+        printf_description "(один замер на сервер, промахи перепроверяются) с отдельным"
         printf_description "отчётом в Telegram. Норма — 3-4 прогона в день."
         echo ""
 
@@ -976,14 +955,18 @@ _skynet_censorcheck_menu() {
             cron_status="${C_YELLOW}задание есть, время не размечено${C_RESET} — задай заново через [e]"
         fi
 
+        local mode_status="${C_GREEN}по географии${C_RESET} (города и операторы)"
+        [[ "${TSPU_CHECK_MODE:-geo}" == "common" ]] && mode_status="${C_GREEN}общая${C_RESET} (без разбивки по городам)"
+
         printf_description "Telegram:          ${tg_status}"
         printf_description "RIPE Atlas ключ:   ${ripe_status}"
+        printf_description "Режим проверки:    ${mode_status}"
         printf_description "Расписание:        ${cron_status}"
         echo ""
 
         printf_menu_option "n" "Настроить TG_BOT_TOKEN / TG_CHAT_ID"
         printf_menu_option "k" "Настроить RIPE Atlas API-ключ / SNI"
-        printf_menu_option "g" "Выборка зондов по городам и цена прогона"
+        printf_menu_option "g" "Режим проверки, выборка зондов и цена прогона"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
         printf_menu_option "r" "Запустить проверку и отчёт СЕЙЧАС"
         echo ""
