@@ -289,6 +289,7 @@ _skynet_tspu_probe_once() {
 # Итог по одному серверу. Читает <tmp_dir>/<idx>.out, оставленный
 # _skynet_tspu_probe_once, и печатает:
 #   AVAILABLE|BLOCKED|SKIP <детали>              - ровно одна первая строка
+#   STAT <успешно> <всего>                        - для сводки по флоту
 #   CITY <промахов> <процент> <asn,asn|-> <город> - 0..N, только проблемные
 #
 # Подтверждение промаха живёт в tspu_probe.py: сюда приходят уже только те
@@ -321,25 +322,18 @@ _skynet_tspu_summarize_server() {
         note=" · в расчёт пошло ${total} $(_skynet_censorcheck_plural "$total" зонд зонда зондов) из $(( total + aside ))"
     fi
 
+    # Операторы в строке сервера не называются: кто именно режет - вопрос
+    # места, и ответ на него даётся в разделе по городам, где ASN привязан
+    # к конкретному городу и потому что-то значит.
     if [[ "$blocked" -eq 0 ]]; then
         echo "AVAILABLE${note:+ ${note# · }}"
     else
-        local blockers="" cnt name asn sorted
-        sorted=$(
-            while read -r _tag asn cnt; do
-                [[ -n "$asn" ]] || continue
-                printf '%s	%s
-' "$cnt" "${_TSPU_ASN_NAMES[$asn]:-AS$asn}"
-            done < <(grep '^ASN ' "$file") | sort -k1,1nr -k2,2
-        )
-        while IFS=$'	' read -r cnt name; do
-            [[ -n "$name" ]] || continue
-            blockers+="${name}(${cnt}), "
-        done <<< "$sorted"
-        blockers="${blockers%, }"
-
-        echo "BLOCKED доступно ${percent}% (${success}/${total})${blockers:+, блокируют: ${blockers}}${note}"
+        echo "BLOCKED доступно ${percent}% (${success}/${total})${note}"
     fi
+
+    # Машиночитаемая строка для сводки по флоту: складывать проценты серверов
+    # напрямую нельзя, у них разные знаменатели.
+    echo "STAT ${success} ${total}"
 
     # Города python отдаёт уже отфильтрованными - только те, где есть
     # подтверждённые промахи. Пересчитываем в проценты и сортируем по
@@ -480,6 +474,10 @@ _skynet_censorcheck_run_and_report() {
     # ("Нижний Новгород") ассоциативному массиву не мешает.
     local -A city_servers=() city_asns=()
 
+    # Зонды всего флота в одной куче: доступность по флоту это доля дошедших
+    # зондов, а не среднее из процентов серверов - у тех разные знаменатели.
+    local fleet_ok=0 fleet_total=0
+
     for ((idx = 1; idx <= count; idx++)); do
         name=$(cat "${tmp_dir}/${idx}.name" 2>/dev/null)
         result=$(head -1 "${tmp_dir}/${idx}.result" 2>/dev/null)
@@ -507,6 +505,13 @@ _skynet_censorcheck_run_and_report() {
                 skip_list+="• ${esc_name}${detail:+ — ${detail}}"$'\n'
                 ;;
         esac
+
+        local _s s_ok s_tot
+        read -r _s s_ok s_tot < <(grep '^STAT ' "${tmp_dir}/${idx}.result" 2>/dev/null)
+        if [[ -n "${s_tot:-}" ]]; then
+            fleet_ok=$(( fleet_ok + s_ok ))
+            fleet_total=$(( fleet_total + s_tot ))
+        fi
 
         # В географию идут только те серверы, у которых есть что показать.
         # Имя сервера без IP: в списке городов важно КТО, а адрес уже назван
@@ -551,6 +556,7 @@ _skynet_censorcheck_run_and_report() {
         geo_list+="• <b>${esc_city}</b> — ${city_servers[$city]%, }${ops:+ · ${ops}}"$'\n'
     done
     clean_list="${clean_list%, }"
+    local hit_cities=${#city_servers[@]}
 
     local report="<tg-emoji emoji-id=\"5474410313853998290\">💡</tg-emoji> <b>Блокировка ТСПУ — отчёт по флоту</b>"$'\n\n'"<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
 
@@ -558,7 +564,11 @@ _skynet_censorcheck_run_and_report() {
         report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Доступно (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
     fi
 
-    if [[ -n "$fail_list" ]]; then
+    # Отдельного списка заблокированных серверов нет: где именно режут -
+    # видно в разделе по городам, а он же называет и оператора. Список
+    # остаётся только в режиме common, где городов не бывает вовсе и иначе
+    # заблокированные серверы просто не попали бы в отчёт.
+    if [[ -n "$fail_list" && -z "$geo_list" ]]; then
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> <b>Заблокировано (${blocked_n}):</b>"$'\n'"${fail_list}</blockquote>"$'\n'
     fi
 
@@ -566,15 +576,30 @@ _skynet_censorcheck_run_and_report() {
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5242222002420346059\">⬇️</tg-emoji> <b>Требуют проверки (${skip_n}):</b>"$'\n'"${skip_list}</blockquote>"$'\n'
     fi
 
-    # География идёт последней и только когда есть о чём говорить: в спокойный
-    # день это лишний экран текста про то, что всё хорошо.
     if [[ -n "$geo_list" ]]; then
-        report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>География блокировок:</b>"$'\n'"${geo_list}"
+        report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Блокировки по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
         [[ -n "$clean_list" ]] && report+=$'\n'"<i>Чисто: ${clean_list}</i>"$'\n'
         report+="</blockquote>"$'\n'
     fi
 
-    report+=$'\n'"Итого: ${total} $(_skynet_censorcheck_plural "$total" сервер сервера серверов) · ${blocked_n} заблокировано · ${skip_n} пропущено"
+    # Сводка в процентах. Доступность по флоту считается по зондам, а не как
+    # среднее из процентов серверов: у сервера, который не удалось померить,
+    # процента нет вовсе, и он не должен тянуть среднее ни вверх, ни вниз.
+    local measured=$(( ok_n + blocked_n ))
+
+    report+=$'\n'"📊 <b>Сводка</b>"$'\n'
+    if [[ "$fleet_total" -gt 0 ]]; then
+        report+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)"$'\n'
+        report+="• Серверов с блокировками: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
+        if [[ "$city_n" -gt 0 ]]; then
+            report+="• Городов с блокировками: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
+        fi
+    else
+        # Ни одного удавшегося замера: показывать 100% доступности здесь было
+        # бы прямой ложью.
+        report+="• Доступность по флоту: <b>нет данных</b>"$'\n'
+    fi
+    [[ "$skip_n" -gt 0 ]] && report+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
 
     if _skynet_censorcheck_tg_send "$report"; then
         [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено)."
