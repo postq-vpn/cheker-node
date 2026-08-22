@@ -10,8 +10,8 @@
 set -e
 
 # --- Настройки (можно вынести, но для простоты оставим здесь) ---
-REPO_OWNER="kiloo11"
-REPO_NAME="Reshala-pq"
+REPO_OWNER="postq-vpn"
+REPO_NAME="cheker-node"
 REPO_BRANCH="main" # <-- ВАЖНО: Укажи правильную ветку!
 
 # --- Цвета ---
