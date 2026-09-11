@@ -87,13 +87,50 @@ _skynet_censorcheck_html_escape() {
     printf '%s' "$s"
 }
 
+# Разбор CSV-списка TSPU_EXCLUDED_SERVERS в массив имён. У серверов флота
+# имена часто вида "Город – IP" с самыми настоящими пробелами внутри (это
+# не мусор, так их назвал пользователь) - поэтому обрезаем пробелы только
+# по КРАЯМ каждого элемента (последствия старого мусора вида "a, b"), а не
+# вычищаем их из строки целиком, как это можно делать с именами файлов
+# (см. ENABLED_WIDGETS в modules/ui/widget_manager.sh, где пробелов в
+# именах не бывает в принципе).
+_skynet_tspu_csv_items() {
+    local csv="$1" item
+    local -a raw=()
+    IFS=',' read -ra raw <<< "$csv"
+    for item in "${raw[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        [[ -n "$item" ]] && printf '%s\n' "$item"
+    done
+}
+
+# Есть ли имя в CSV-списке (точное совпадение после обрезки пробелов по краям).
+_skynet_tspu_csv_contains() {
+    local needle="$1" csv="$2" item
+    while IFS= read -r item; do
+        [[ "$item" == "$needle" ]] && return 0
+    done < <(_skynet_tspu_csv_items "$csv")
+    return 1
+}
+
+# Убирает имя из CSV-списка, попутно схлопывая накопившийся мусор пробелов
+# вокруг запятых (наследие бага с tr -d ' ').
+_skynet_tspu_csv_remove() {
+    local needle="$1" csv="$2" item out=""
+    while IFS= read -r item; do
+        [[ "$item" == "$needle" ]] && continue
+        out+="${out:+,}${item}"
+    done < <(_skynet_tspu_csv_items "$csv")
+    printf '%s' "$out"
+}
+
 # Сколько серверов сейчас исключено из проверки ТСПУ (TSPU_EXCLUDED_SERVERS,
 # меню [s]). Используется и в отчёте, и в прикидке цены прогона, и в статусе
 # главного меню — чтобы список не разъезжался с реальным подсчётом.
 _skynet_tspu_excluded_count() {
-    local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS" | tr -d ' \t\r')
-    [[ -z "$excluded" ]] && { echo 0; return; }
-    echo "$excluded" | tr ',' '\n' | grep -c .
+    local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
+    _skynet_tspu_csv_items "$excluded" | grep -c .
 }
 
 # Отправляет ОДИН кусок текста (<=4096 символов) в Telegram.
@@ -373,7 +410,6 @@ _skynet_tspu_check_fleet_parallel() {
     local tmp_dir; tmp_dir=$(mktemp -d)
 
     local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
-    excluded=$(echo "$excluded" | tr -d ' \t\r')
 
     local -a lines=()
     local line
@@ -386,14 +422,13 @@ _skynet_tspu_check_fleet_parallel() {
     for line in "${lines[@]}"; do
         IFS='|' read -r name user ip port key_path sudo_pass <<< "$line"
         [[ -z "$name" ]] && continue
-        # \r отваливается отдельно от excluded (см. tr выше) - без этого имя
-        # с хвостовым \r (частый гость при вставке в SSH-терминал из Windows)
-        # никогда не совпадёт со списком исключений и не пропустится.
+        # Хвостовой \r (частый гость при вставке в SSH-терминал из Windows)
+        # иначе никогда не совпадёт со списком исключений.
         name="${name%$'\r'}"
 
         # Исключённый сервер не бьётся зондами вообще - имя откладывается для
         # отчёта, а сам сервер даже не входит в счётчик .count.
-        if [[ ",$excluded," == *",$name,"* ]]; then
+        if _skynet_tspu_csv_contains "$name" "$excluded"; then
             echo "$name" >> "${tmp_dir}/.excluded"
             continue
         fi
@@ -979,7 +1014,6 @@ _skynet_censorcheck_servers_menu() {
         fi
 
         local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
-        excluded=$(echo "$excluded" | tr -d ' \t\r')
 
         local -a names=()
         local i=1 name user ip port key_path sudo_pass
@@ -989,7 +1023,7 @@ _skynet_censorcheck_servers_menu() {
             names[$i]="$name"
 
             local status status_color
-            if [[ ",$excluded," == *",$name,"* ]]; then
+            if _skynet_tspu_csv_contains "$name" "$excluded"; then
                 status="ИСКЛЮЧЁН"; status_color="${C_RED}"
             else
                 status="ПРОВЕРЯЕТСЯ"; status_color="${C_GREEN}"
@@ -1010,8 +1044,8 @@ _skynet_censorcheck_servers_menu() {
             *)
                 if [[ "$choice" =~ ^[0-9]+$ ]] && [[ -n "${names[$choice]:-}" ]]; then
                     local selected="${names[$choice]}"
-                    if [[ ",$excluded," == *",$selected,"* ]]; then
-                        excluded=$(echo ",$excluded," | sed "s|,$selected,|,|g" | sed 's/^,//;s/,$//')
+                    if _skynet_tspu_csv_contains "$selected" "$excluded"; then
+                        excluded=$(_skynet_tspu_csv_remove "$selected" "$excluded")
                         printf_ok "Сервер '${selected}' снова участвует в проверке."
                     else
                         if [[ -z "$excluded" ]]; then
