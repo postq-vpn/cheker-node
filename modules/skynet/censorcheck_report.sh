@@ -87,6 +87,15 @@ _skynet_censorcheck_html_escape() {
     printf '%s' "$s"
 }
 
+# Сколько серверов сейчас исключено из проверки ТСПУ (TSPU_EXCLUDED_SERVERS,
+# меню [s]). Используется и в отчёте, и в прикидке цены прогона, и в статусе
+# главного меню — чтобы список не разъезжался с реальным подсчётом.
+_skynet_tspu_excluded_count() {
+    local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS" | tr -d ' \t\r')
+    [[ -z "$excluded" ]] && { echo 0; return; }
+    echo "$excluded" | tr ',' '\n' | grep -c .
+}
+
 # Отправляет ОДИН кусок текста (<=4096 символов) в Telegram.
 # Печатает HTTP-код ответа в stdout.
 _skynet_censorcheck_tg_send_chunk() {
@@ -349,10 +358,12 @@ _skynet_tspu_summarize_server() {
 
 # Прогоняет весь флот (без SSH, напрямую по IP из базы флота). Результаты -
 # в файлах внутри временной директории, путь к которой печатает в stdout:
-#   <tmp_dir>/N.name   - "Имя (IP)"
-#   <tmp_dir>/N.out    - сырой выхлоп замера сервера N
-#   <tmp_dir>/N.result - вердикт + строки CITY (см. _skynet_tspu_summarize_server)
-#   <tmp_dir>/.count   - количество серверов N
+#   <tmp_dir>/N.name    - "Имя (IP)"
+#   <tmp_dir>/N.out     - сырой выхлоп замера сервера N
+#   <tmp_dir>/N.result  - вердикт + строки CITY (см. _skynet_tspu_summarize_server)
+#   <tmp_dir>/.count    - количество проверенных серверов N
+#   <tmp_dir>/.excluded - имена серверов, пропущенных по TSPU_EXCLUDED_SERVERS
+#                         (по одному в строке), файла нет, если таких нет
 #
 # Серверы идут ПАРАЛЛЕЛЬНО, по одному замеру на сервер: перепроверка промахов
 # спрятана внутрь tspu_probe.py и тратит замеры только на те зонды, которым
@@ -360,6 +371,9 @@ _skynet_tspu_summarize_server() {
 _skynet_tspu_check_fleet_parallel() {
     local sni="$1" api_key="$2"
     local tmp_dir; tmp_dir=$(mktemp -d)
+
+    local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
+    excluded=$(echo "$excluded" | tr -d ' \t\r')
 
     local -a lines=()
     local line
@@ -372,6 +386,14 @@ _skynet_tspu_check_fleet_parallel() {
     for line in "${lines[@]}"; do
         IFS='|' read -r name user ip port key_path sudo_pass <<< "$line"
         [[ -z "$name" ]] && continue
+
+        # Исключённый сервер не бьётся зондами вообще - имя откладывается для
+        # отчёта, а сам сервер даже не входит в счётчик .count.
+        if [[ ",$excluded," == *",$name,"* ]]; then
+            echo "$name" >> "${tmp_dir}/.excluded"
+            continue
+        fi
+
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
         ( _skynet_tspu_probe_once "$ip" "$sni" "$api_key" > "${tmp_dir}/${i}.out" ) &
@@ -460,6 +482,11 @@ _skynet_censorcheck_run_and_report() {
         printf_info "Проверяю доступность всех серверов флота из сетей РФ (RIPE Atlas, параллельно)."
         printf_info "Выборка: ${sample_line}, по одному замеру на сервер."
         printf_info "Промахи перепроверяются отдельно — это займёт пару минут."
+
+        local excluded_pre_n; excluded_pre_n=$(_skynet_tspu_excluded_count)
+        if [[ "$excluded_pre_n" -gt 0 ]]; then
+            printf_info "Исключено из проверки: ${excluded_pre_n} $(_skynet_censorcheck_plural "$excluded_pre_n" сервер сервера серверов) (меню [s])."
+        fi
     fi
 
     local tmp_dir; tmp_dir=$(_skynet_tspu_check_fleet_parallel "$sni" "$RIPE_API_KEY")
@@ -524,6 +551,20 @@ _skynet_censorcheck_run_and_report() {
             [[ "$asns" != "-" ]] && city_asns["$city"]+="${asns},"
         done < <(grep '^CITY ' "${tmp_dir}/${idx}.result" 2>/dev/null)
     done
+
+    # Серверы, исключённые через TSPU_EXCLUDED_SERVERS ([s] в меню) - в
+    # проверке не участвовали вовсе, но отчёт должен явно называть, кто
+    # пропущен и почему, а не просто молчать о них.
+    local excluded_list="" excluded_n=0 ex_name esc_ex_name
+    if [[ -f "${tmp_dir}/.excluded" ]]; then
+        while IFS= read -r ex_name; do
+            [[ -n "$ex_name" ]] || continue
+            excluded_n=$((excluded_n + 1))
+            esc_ex_name=$(_skynet_censorcheck_html_escape "$ex_name")
+            excluded_list+="• ${esc_ex_name}"$'\n'
+        done < "${tmp_dir}/.excluded"
+    fi
+
     rm -rf "$tmp_dir"
 
     # Номера ASN в имена операторов: свои переводы для крупных операторов,
@@ -576,6 +617,10 @@ _skynet_censorcheck_run_and_report() {
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5242222002420346059\">⬇️</tg-emoji> <b>Требуют проверки (${skip_n}):</b>"$'\n'"${skip_list}</blockquote>"$'\n'
     fi
 
+    if [[ -n "$excluded_list" ]]; then
+        report+=$'\n'"<blockquote expandable>🚫 <b>Исключены из проверки (${excluded_n}):</b>"$'\n'"${excluded_list}</blockquote>"$'\n'
+    fi
+
     if [[ -n "$geo_list" ]]; then
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Блокировки по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
         [[ -n "$clean_list" ]] && report+=$'\n'"<i>Чисто: ${clean_list}</i>"$'\n'
@@ -600,10 +645,11 @@ _skynet_censorcheck_run_and_report() {
         report+="• Доступность по флоту: <b>нет данных</b>"$'\n'
     fi
     [[ "$skip_n" -gt 0 ]] && report+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
+    [[ "$excluded_n" -gt 0 ]] && report+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
 
     if _skynet_censorcheck_tg_send "$report"; then
-        [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено)."
-        log "CensorCheck: отчёт отправлен (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено)."
+        [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено)."
+        log "CensorCheck: отчёт отправлен (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено)."
         return 0
     else
         [[ "$verbose" -eq 1 ]] && printf_error "Не удалось отправить отчёт в Telegram."
@@ -856,12 +902,15 @@ _skynet_censorcheck_probe_set_menu() {
         # маленьких замера на каждый промахнувшийся зонд.
         local fleet_n=0
         [[ -s "$FLEET_DATABASE_FILE" ]] && fleet_n=$(grep -c . "$FLEET_DATABASE_FILE")
+        local excluded_n; excluded_n=$(_skynet_tspu_excluded_count)
+        fleet_n=$(( fleet_n - excluded_n ))
+        [[ "$fleet_n" -lt 0 ]] && fleet_n=0
         local per_msm=$(( probe_n * _CENSORCHECK_CREDITS_PER_PROBE ))
         local per_run=$(( per_msm * fleet_n ))
         local runs; runs=$(_skynet_censorcheck_times | grep -c .)
 
         printf_description "Цена прогона: ${C_YELLOW}${per_run}${C_RESET} кредитов RIPE Atlas"
-        printf_description "  (${probe_n} зондов × 10 × ${fleet_n} серверов, без блокировок)"
+        printf_description "  (${probe_n} зондов × 10 × ${fleet_n} серверов, без блокировок$([[ "$excluded_n" -gt 0 ]] && echo ", ${excluded_n} исключено"))"
         if [[ "$runs" -gt 0 ]]; then
             printf_description "В сутки при ${runs} прогонах: ${C_YELLOW}$(( per_run * runs ))${C_RESET} кредитов"
             printf_description "  (свой зонд RIPE Atlas приносит 21600 кредитов в сутки)"
@@ -903,6 +952,77 @@ _skynet_censorcheck_probe_set_menu() {
                 ;;
             [bB]) break ;;
             *) printf_error "Неверный выбор."; sleep 1 ;;
+        esac
+    done
+}
+
+# Какие серверы флота участвуют в проверке ТСПУ. Исключённые хранятся в
+# TSPU_EXCLUDED_SERVERS (config/reshala.conf) как список имён через запятую -
+# тот же приём, что ENABLED_WIDGETS в modules/ui/widget_manager.sh. Привязка
+# идёт по имени сервера (уникальный ключ в базе флота).
+_skynet_censorcheck_servers_menu() {
+    while true; do
+        clear
+        menu_header "🖥 Серверы в проверке ТСПУ"
+        printf_description "Исключённый сервер не бьётся зондами RIPE Atlas и не тратит"
+        printf_description "кредиты. В отчёте о нём отдельная строка «исключён из проверки»."
+        echo ""
+
+        if [[ ! -s "$FLEET_DATABASE_FILE" ]]; then
+            printf_warning "Флот пуст, выбирать нечего."
+            wait_for_enter
+            return
+        fi
+
+        local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
+        excluded=$(echo "$excluded" | tr -d ' \t\r')
+
+        local -a names=()
+        local i=1 name user ip port key_path sudo_pass
+        while IFS='|' read -r name user ip port key_path sudo_pass; do
+            [[ -z "$name" ]] && continue
+            names[$i]="$name"
+
+            local status status_color
+            if [[ ",$excluded," == *",$name,"* ]]; then
+                status="ИСКЛЮЧЁН"; status_color="${C_RED}"
+            else
+                status="ПРОВЕРЯЕТСЯ"; status_color="${C_GREEN}"
+            fi
+
+            local menu_text; menu_text=$(printf "%b%-12s%b - %s (%s)" "$status_color" "[$status]" "${C_RESET}" "$name" "$ip")
+            printf_menu_option "$i" "$menu_text"
+            ((i++))
+        done < "$FLEET_DATABASE_FILE"
+
+        echo ""
+        printf_menu_option "b" "Назад"
+        echo ""
+
+        local choice; choice=$(safe_read "Номер сервера для переключения или буква: " "") || { _LAST_CTRLC_SIGNALED=0; continue; }
+        case "$choice" in
+            [bB]) break ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [[ -n "${names[$choice]:-}" ]]; then
+                    local selected="${names[$choice]}"
+                    if [[ ",$excluded," == *",$selected,"* ]]; then
+                        excluded=$(echo ",$excluded," | sed "s|,$selected,|,|g" | sed 's/^,//;s/,$//')
+                        printf_ok "Сервер '${selected}' снова участвует в проверке."
+                    else
+                        if [[ -z "$excluded" ]]; then
+                            excluded="$selected"
+                        else
+                            excluded="$excluded,$selected"
+                        fi
+                        printf_ok "Сервер '${selected}' исключён из проверки."
+                    fi
+                    set_config_var "TSPU_EXCLUDED_SERVERS" "$excluded"
+                    sleep 1
+                else
+                    printf_error "Неверный выбор."
+                    sleep 1
+                fi
+                ;;
         esac
     done
 }
@@ -983,15 +1103,21 @@ _skynet_censorcheck_menu() {
         local mode_status="${C_GREEN}по географии${C_RESET} (города и операторы)"
         [[ "${TSPU_CHECK_MODE:-geo}" == "common" ]] && mode_status="${C_GREEN}общая${C_RESET} (без разбивки по городам)"
 
+        local servers_status="${C_GREEN}все${C_RESET}"
+        local excluded_n_status; excluded_n_status=$(_skynet_tspu_excluded_count)
+        [[ "$excluded_n_status" -gt 0 ]] && servers_status="${C_YELLOW}исключено ${excluded_n_status}${C_RESET}"
+
         printf_description "Telegram:          ${tg_status}"
         printf_description "RIPE Atlas ключ:   ${ripe_status}"
         printf_description "Режим проверки:    ${mode_status}"
+        printf_description "Серверы в проверке: ${servers_status}"
         printf_description "Расписание:        ${cron_status}"
         echo ""
 
         printf_menu_option "n" "Настроить TG_BOT_TOKEN / TG_CHAT_ID"
         printf_menu_option "k" "Настроить RIPE Atlas API-ключ / SNI"
         printf_menu_option "g" "Режим проверки, выборка зондов и цена прогона"
+        printf_menu_option "s" "Серверы в проверке (включить/исключить)"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
         printf_menu_option "r" "Запустить проверку и отчёт СЕЙЧАС"
         echo ""
@@ -1003,6 +1129,7 @@ _skynet_censorcheck_menu() {
             [nN]) _skynet_censorcheck_configure_telegram ;;
             [kK]) _skynet_censorcheck_configure_ripe ;;
             [gG]) _skynet_censorcheck_probe_set_menu ;;
+            [sS]) _skynet_censorcheck_servers_menu ;;
             [eE]) _skynet_censorcheck_schedule_menu ;;
             [rR])
                 if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]]; then
