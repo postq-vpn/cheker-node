@@ -386,6 +386,10 @@ _skynet_tspu_check_fleet_parallel() {
     for line in "${lines[@]}"; do
         IFS='|' read -r name user ip port key_path sudo_pass <<< "$line"
         [[ -z "$name" ]] && continue
+        # \r отваливается отдельно от excluded (см. tr выше) - без этого имя
+        # с хвостовым \r (частый гость при вставке в SSH-терминал из Windows)
+        # никогда не совпадёт со списком исключений и не пропустится.
+        name="${name%$'\r'}"
 
         # Исключённый сервер не бьётся зондами вообще - имя откладывается для
         # отчёта, а сам сервер даже не входит в счётчик .count.
@@ -981,6 +985,7 @@ _skynet_censorcheck_servers_menu() {
         local i=1 name user ip port key_path sudo_pass
         while IFS='|' read -r name user ip port key_path sudo_pass; do
             [[ -z "$name" ]] && continue
+            name="${name%$'\r'}"
             names[$i]="$name"
 
             local status status_color
