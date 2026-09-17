@@ -555,7 +555,13 @@ _skynet_censorcheck_run_and_report() {
     # Все три группы - одинаковый вид: сворачиваемая (expandable) цитата
     # с заголовком-счётчиком, внутри - КАЖДЫЙ сервер отдельной строкой.
     local ok_list="" fail_list="" skip_list=""
-    local total=0 ok_n=0 blocked_n=0 skip_n=0 idx name result kind detail esc_name
+    local total=0 ok_n=0 blocked_n=0 skip_n=0 idx name result kind detail esc_name category
+
+    # Инфра (категория "infra") идёт отдельным блоком от основного флота -
+    # не в ok_list/fail_list/skip_list, и без веса в fleet_ok/fleet_total:
+    # это служебные серверы, а не VPN-ноды, и общий процент доступности
+    # флота не должен зависеть от них.
+    local infra_list="" infra_ok_n=0 infra_blocked_n=0 infra_skip_n=0
 
     # Город -> кто в нём недоступен и чьи это сети. Ключ с пробелом внутри
     # ("Нижний Новгород") ассоциативному массиву не мешает.
@@ -568,7 +574,7 @@ _skynet_censorcheck_run_and_report() {
     for ((idx = 1; idx <= count; idx++)); do
         name=$(cat "${tmp_dir}/${idx}.name" 2>/dev/null)
         result=$(head -1 "${tmp_dir}/${idx}.result" 2>/dev/null)
-        total=$((total + 1))
+        category=$(cat "${tmp_dir}/${idx}.category" 2>/dev/null || echo fleet)
         esc_name=$(_skynet_censorcheck_html_escape "$name")
 
         kind="${result%% *}"
@@ -576,6 +582,27 @@ _skynet_censorcheck_run_and_report() {
         [[ "$detail" == "$result" ]] && detail=""
         detail=$(_skynet_censorcheck_html_escape "$detail")
 
+        # У инфры "total"/skip_n/ok_n/blocked_n не считаются вовсе - это
+        # счётчики для секции основного флота, инфра ведёт свои (infra_*).
+        if [[ "$category" == "infra" ]]; then
+            case "$kind" in
+                AVAILABLE)
+                    infra_ok_n=$((infra_ok_n + 1))
+                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
+                    ;;
+                BLOCKED)
+                    infra_blocked_n=$((infra_blocked_n + 1))
+                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> не доступен"$'\n'
+                    ;;
+                *)
+                    infra_skip_n=$((infra_skip_n + 1))
+                    infra_list+="• ${esc_name}${detail:+ — ${detail}}"$'\n'
+                    ;;
+            esac
+            continue
+        fi
+
+        total=$((total + 1))
         case "$kind" in
             AVAILABLE)
                 # Деталь у доступного сервера появляется только когда есть что
@@ -665,6 +692,13 @@ _skynet_censorcheck_run_and_report() {
         report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Доступно (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
     fi
 
+    # Инфра - отдельным блоком от основного флота: свой список, свой счётчик,
+    # без процентов и городов (см. _skynet_tspu_summarize_server).
+    if [[ -n "$infra_list" ]]; then
+        local infra_total_n=$(( infra_ok_n + infra_blocked_n + infra_skip_n ))
+        report+=$'\n'"<blockquote expandable>🧩 <b>Инфра (${infra_total_n}):</b>"$'\n'"${infra_list}</blockquote>"$'\n'
+    fi
+
     # Отдельного списка заблокированных серверов нет: где именно режут -
     # видно в разделе по городам, а он же называет и оператора. Список
     # остаётся только в режиме common, где городов не бывает вовсе и иначе
@@ -694,7 +728,9 @@ _skynet_censorcheck_run_and_report() {
 
     report+=$'\n'"📊 <b>Сводка</b>"$'\n'
     if [[ "$fleet_total" -gt 0 ]]; then
-        report+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)"$'\n'
+        # "Без учёта инфры" явно проговариваем: зонды инфра-серверов сюда не
+        # входят (у инфры отдельный вердикт по 60%-порогу, а не по зондам).
+        report+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
         report+="• Серверов с блокировками: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
         if [[ "$city_n" -gt 0 ]]; then
             report+="• Городов с блокировками: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
@@ -706,6 +742,16 @@ _skynet_censorcheck_run_and_report() {
     fi
     [[ "$skip_n" -gt 0 ]] && report+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
     [[ "$excluded_n" -gt 0 ]] && report+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
+    if [[ -n "$infra_list" ]]; then
+        local infra_measured=$(( infra_ok_n + infra_blocked_n ))
+        if [[ "$infra_measured" -gt 0 ]]; then
+            report+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> доступно"
+            [[ "$infra_skip_n" -gt 0 ]] && report+=" (${infra_skip_n} требует проверки)"
+            report+=$'\n'
+        else
+            report+="• Инфра: <b>нет данных</b> (${infra_skip_n} требует проверки)"$'\n'
+        fi
+    fi
 
     if _skynet_censorcheck_tg_send "$report"; then
         [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено)."
