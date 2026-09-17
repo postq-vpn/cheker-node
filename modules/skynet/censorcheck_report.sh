@@ -29,6 +29,13 @@ source "${SCRIPT_DIR}/modules/skynet/db.sh"
 _CENSORCHECK_CRON_FILE="/etc/cron.d/reshala-censorcheck"
 _TSPU_PROBE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_probe.py"
 
+# Вердикт последней проверки ТСПУ по инфра-серверам - отдельно от Telegram
+# отчёта. Читает plugins/dashboard_widgets/05_infra_tspu.sh: виджет
+# пересобирается каждую минуту, а зонды RIPE Atlas бьют по расписанию
+# несколько раз в день, так что показывать на дашборде можно только то, что
+# уже здесь сохранено, без нового замера.
+_TSPU_INFRA_STATE_FILE="/etc/reshala/tspu_infra.state"
+
 # Сколько проверок в день считаем нормой. Дальше добавлять можно, но со
 # спросом: каждый прогон создаёт измерение RIPE Atlas на КАЖДЫЙ сервер флота
 # (кредиты не бесконечные, см. _skynet_censorcheck_probe_set_menu) и
@@ -337,6 +344,24 @@ _skynet_tspu_probe_once() {
     echo "$py_out"
 }
 
+# Сохраняет вердикт последней проверки ТСПУ по инфра-серверам в файл
+# состояния - читает его виджет дашборда (05_infra_tspu.sh), сам он новых
+# замеров не делает. Вызывается только когда в флоте вообще есть инфра-
+# серверы (пустой $lines означает "нечего сохранять", а не "все пропали").
+_skynet_tspu_infra_save_state() {
+    local lines="$1" ok="$2" blocked="$3" skip="$4"
+    [[ -n "$lines" ]] || return 0
+
+    mkdir -p "$(dirname "$_TSPU_INFRA_STATE_FILE")" 2>/dev/null || true
+    {
+        printf 'TS=%s\n' "$(msk_date '+%d.%m %H:%M')"
+        printf 'OK=%s\n' "$ok"
+        printf 'BLOCKED=%s\n' "$blocked"
+        printf 'SKIP=%s\n' "$skip"
+        printf '%s' "$lines"
+    } > "$_TSPU_INFRA_STATE_FILE" 2>/dev/null
+}
+
 # Итог по одному серверу. Читает <tmp_dir>/<idx>.out, оставленный
 # _skynet_tspu_probe_once, и печатает:
 #   AVAILABLE|BLOCKED|SKIP <детали>              - ровно одна первая строка
@@ -562,6 +587,9 @@ _skynet_censorcheck_run_and_report() {
     # это служебные серверы, а не VPN-ноды, и общий процент доступности
     # флота не должен зависеть от них.
     local infra_list="" infra_ok_n=0 infra_blocked_n=0 infra_skip_n=0
+    # "имя|ВЕРДИКТ" по одному на строку - сырьё для _skynet_tspu_infra_save_state,
+    # без HTML-экранирования и без IP (виджету он не нужен).
+    local infra_state_lines=""
 
     # Город -> кто в нём недоступен и чьи это сети. Ключ с пробелом внутри
     # ("Нижний Новгород") ассоциативному массиву не мешает.
@@ -585,18 +613,24 @@ _skynet_censorcheck_run_and_report() {
         # У инфры "total"/skip_n/ok_n/blocked_n не считаются вовсе - это
         # счётчики для секции основного флота, инфра ведёт свои (infra_*).
         if [[ "$category" == "infra" ]]; then
+            # Без IP: в имени сервера он приписан как "Имя (IP)" - для
+            # виджета на дашборде это лишний шум, там только "Имя".
+            local infra_bare_name="${name%% (*}"
             case "$kind" in
                 AVAILABLE)
                     infra_ok_n=$((infra_ok_n + 1))
                     infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
+                    infra_state_lines+="${infra_bare_name}|AVAILABLE"$'\n'
                     ;;
                 BLOCKED)
                     infra_blocked_n=$((infra_blocked_n + 1))
                     infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> не доступен"$'\n'
+                    infra_state_lines+="${infra_bare_name}|BLOCKED"$'\n'
                     ;;
                 *)
                     infra_skip_n=$((infra_skip_n + 1))
                     infra_list+="• ${esc_name}${detail:+ — ${detail}}"$'\n'
+                    infra_state_lines+="${infra_bare_name}|SKIP"$'\n'
                     ;;
             esac
             continue
@@ -641,6 +675,8 @@ _skynet_censorcheck_run_and_report() {
             [[ "$asns" != "-" ]] && city_asns["$city"]+="${asns},"
         done < <(grep '^CITY ' "${tmp_dir}/${idx}.result" 2>/dev/null)
     done
+
+    _skynet_tspu_infra_save_state "$infra_state_lines" "$infra_ok_n" "$infra_blocked_n" "$infra_skip_n"
 
     # Серверы, исключённые через TSPU_EXCLUDED_SERVERS ([s] в меню) - в
     # проверке не участвовали вовсе, но отчёт должен явно называть, кто
