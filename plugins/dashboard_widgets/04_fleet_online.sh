@@ -36,7 +36,7 @@ total=0
 
 # Опрашиваем серверы параллельно: последовательно весь флот упёрся бы
 # в TIMEOUT на каждом мёртвом сервере.
-while IFS='|' read -r name user ip port key_path sudo_pass; do
+while IFS='|' read -r name user ip port key_path sudo_pass category; do
     [ -n "$ip" ] || continue
     total=$((total + 1))
     (

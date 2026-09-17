@@ -185,7 +185,7 @@ _get_servers_using_key() {
     local server_names=""
     local server_line
     if [ -f "$FLEET_DATABASE_FILE" ]; then
-        while IFS='|' read -r name user ip port key_path sudo_pass; do
+        while IFS='|' read -r name user ip port key_path sudo_pass category; do
             if [[ "$key_path" == "$target_key_path" ]]; then
                 if [[ -z "$server_names" ]]; then
                     server_names="$name"
@@ -206,7 +206,7 @@ _get_server_info_by_key_path() {
     local target_key_path="$1"
     local server_info=""
     if [ -f "$FLEET_DATABASE_FILE" ]; then
-        while IFS='|' read -r name user ip port key_path sudo_pass; do
+        while IFS='|' read -r name user ip port key_path sudo_pass category; do
             if [[ "$key_path" == "$target_key_path" ]]; then
                 server_info="${name}|${ip}"
                 break

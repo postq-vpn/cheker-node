@@ -21,6 +21,11 @@
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && exit 1 # Защита от прямого запуска
 
+# Нужен для _skynet_norm_category (категория "infra" меняет формат вердикта
+# в отчёте ТСПУ). Модуль запускается и напрямую из cron через run_module,
+# где menu.sh не sourced - зависимость объявляется здесь явно.
+source "${SCRIPT_DIR}/modules/skynet/db.sh"
+
 _CENSORCHECK_CRON_FILE="/etc/cron.d/reshala-censorcheck"
 _TSPU_PROBE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_probe.py"
 
@@ -343,7 +348,7 @@ _skynet_tspu_probe_once() {
 # здесь никакого усреднения по раундам нет - одного подтверждённого промаха
 # достаточно, чтобы назвать сервер заблокированным.
 _skynet_tspu_summarize_server() {
-    local tmp_dir="$1" idx="$2"
+    local tmp_dir="$1" idx="$2" category="${3:-fleet}"
     local file="${tmp_dir}/${idx}.out"
 
     [[ -s "$file" ]] || { echo "SKIP замер не выполнялся"; return; }
@@ -356,6 +361,19 @@ _skynet_tspu_summarize_server() {
 
     local _tag percent success total fault dead noise
     read -r _tag percent success total fault dead noise <<< "$head_line"
+
+    # Инфра-серверы (control-plane, панели и т.п., не VPN-ноды) не нужно
+    # показывать с точностью до процента и городов - только грубый вердикт
+    # по порогу: доступен, если пробилось хотя бы 60% зондов, иначе нет.
+    if [[ "$category" == "infra" ]]; then
+        if [[ "$percent" -ge 60 ]]; then
+            echo "AVAILABLE"
+        else
+            echo "BLOCKED недоступен"
+        fi
+        echo "STAT ${success} ${total}"
+        return
+    fi
 
     local blocked=$(( total - success ))
 
@@ -418,10 +436,11 @@ _skynet_tspu_check_fleet_parallel() {
     done < "$FLEET_DATABASE_FILE"
 
     local -a pids=()
-    local i=0 name user ip port key_path sudo_pass
+    local i=0 name user ip port key_path sudo_pass category
     for line in "${lines[@]}"; do
-        IFS='|' read -r name user ip port key_path sudo_pass <<< "$line"
+        IFS='|' read -r name user ip port key_path sudo_pass category <<< "$line"
         [[ -z "$name" ]] && continue
+        category=$(_skynet_norm_category "$category")
         # Хвостовой \r (частый гость при вставке в SSH-терминал из Windows)
         # иначе никогда не совпадёт со списком исключений.
         name="${name%$'\r'}"
@@ -435,6 +454,7 @@ _skynet_tspu_check_fleet_parallel() {
 
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
+        echo "$category" > "${tmp_dir}/${i}.category"
         ( _skynet_tspu_probe_once "$ip" "$sni" "$api_key" > "${tmp_dir}/${i}.out" ) &
         pids+=("$!")
     done
@@ -445,9 +465,10 @@ _skynet_tspu_check_fleet_parallel() {
 
     echo "$i" > "${tmp_dir}/.count"
 
-    local idx
+    local idx idx_category
     for ((idx = 1; idx <= i; idx++)); do
-        _skynet_tspu_summarize_server "$tmp_dir" "$idx" > "${tmp_dir}/${idx}.result"
+        idx_category=$(cat "${tmp_dir}/${idx}.category" 2>/dev/null || echo fleet)
+        _skynet_tspu_summarize_server "$tmp_dir" "$idx" "$idx_category" > "${tmp_dir}/${idx}.result"
     done
 
     echo "$tmp_dir"
@@ -1016,8 +1037,8 @@ _skynet_censorcheck_servers_menu() {
         local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
 
         local -a names=()
-        local i=1 name user ip port key_path sudo_pass
-        while IFS='|' read -r name user ip port key_path sudo_pass; do
+        local i=1 name user ip port key_path sudo_pass category
+        while IFS='|' read -r name user ip port key_path sudo_pass category; do
             [[ -z "$name" ]] && continue
             name="${name%$'\r'}"
             names[$i]="$name"
@@ -1029,7 +1050,7 @@ _skynet_censorcheck_servers_menu() {
                 status="ПРОВЕРЯЕТСЯ"; status_color="${C_GREEN}"
             fi
 
-            local menu_text; menu_text=$(printf "%b%-12s%b - %s (%s)" "$status_color" "[$status]" "${C_RESET}" "$name" "$ip")
+            local menu_text; menu_text=$(printf "%b%-12s%b - %s (%s) [%s]" "$status_color" "[$status]" "${C_RESET}" "$name" "$ip" "$(_skynet_category_label "$category")")
             printf_menu_option "$i" "$menu_text"
             ((i++))
         done < "$FLEET_DATABASE_FILE"

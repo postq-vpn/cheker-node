@@ -905,7 +905,8 @@ These are core conventions and contracts for «Решала». When you change o
 ### 6. Skynet data model and behaviour
 
 - **Fleet DB format (`$FLEET_DATABASE_FILE`):**
-  - Lines are `name|user|ip|port|ssh_key_path|sudo_password`.
+  - Lines are `name|user|ip|port|ssh_key_path|sudo_password|category`.
+  - `category` is `fleet` (VPN node, counted in fleet capacity totals) or `infra` (control-plane/service host, excluded from capacity totals and shown as a simple available/unavailable verdict — threshold 60% — in the TSPU report instead of a percent/city breakdown). It was added after the other fields; older records simply lack it. Every reader must treat a missing/unknown value as `fleet` — see `_skynet_norm_category` in `modules/skynet/db.sh`, the single source of truth for that normalization. `_sanitize_fleet_database` (also in `db.sh`, runs on every fleet-menu render) rewrites old lines with an explicit `fleet` so the field becomes present everywhere over time.
   - Do not change field order or separator (`|`) without a **clear migration path** and back-compat.
 - **Key management:**
   - `SKYNET_MASTER_KEY_NAME` and `SKYNET_UNIQUE_KEY_PREFIX` govern SSH key naming – do not change them lightly; existing fleets depend on these values.

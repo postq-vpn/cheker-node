@@ -59,7 +59,10 @@ _skynet_capacity_run_fleet() {
     local verbose=0
     [[ "${1:-}" == "--verbose" ]] && verbose=1
 
-    local tmp_dir; tmp_dir=$(_skynet_run_plugin_on_fleet_parallel_capture "$_SKYNET_CAPACITY_PLUGIN")
+    # Инфра-серверы (категория "infra") не считаются в вместимость флота -
+    # это служебные машины, а не VPN-ноды, гонять по ним спидтест и складывать
+    # результат в "Общую вместимость" смысла нет.
+    local tmp_dir; tmp_dir=$(_skynet_run_plugin_on_fleet_parallel_capture "$_SKYNET_CAPACITY_PLUGIN" "" "fleet")
     local count; count=$(cat "${tmp_dir}/.count" 2>/dev/null || echo 0)
 
     # Шапку печатаем здесь, а не до запуска: замер идёт минуты, и заголовок
@@ -145,8 +148,10 @@ _skynet_capacity_fleet_test() {
         return
     fi
 
-    local total; total=$(grep -c . "$FLEET_DATABASE_FILE" 2>/dev/null || echo 0)
+    local total; total=$(_skynet_fleet_count_by_category "fleet")
+    local infra_n; infra_n=$(_skynet_fleet_count_by_category "infra")
     printf_warning "Измерение займёт несколько минут и создаст трафик на каждом из ${total} серверов."
+    [[ "$infra_n" -gt 0 ]] && printf_description "Серверы категории «Инфра» (${infra_n}) в замер и в общую вместимость не входят."
     printf_description "На серверах без клиента Ookla он будет установлен автоматически."
     echo ""
     if ! ask_yes_no "Начать измерение? (y/n): " "n"; then

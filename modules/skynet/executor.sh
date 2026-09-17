@@ -8,6 +8,12 @@
 #
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && exit 1 # Защита от прямого запуска
 
+# Нужен для _skynet_norm_category/_skynet_category_label (фильтрация по
+# категории при обходе флота). Модуль подключается и напрямую через
+# run_module (например фоновый замер вместимости), где menu.sh не sourced -
+# поэтому зависимость объявляется здесь явно, а не полагается на чужой source.
+source "${SCRIPT_DIR}/modules/skynet/db.sh"
+
 # Выполнить выбранный плагин Skynet на одном сервере
 _skynet_run_plugin_on_server() {
     local plugin="$1" name="$2" user="$3" ip="$4" port="$5" key_path="$6" sudo_pass="${7:-}"
@@ -135,6 +141,11 @@ _skynet_run_plugin_for_capture() {
 _skynet_run_plugin_on_fleet_parallel_capture() {
     local plugin="$1"
     local env_vars="${2:-}"
+    # Необязательный фильтр по категории ("fleet" | "infra"). Пусто - берём
+    # весь флот, как раньше. Нужен там, где категория меняет сам состав
+    # выборки (например замер вместимости не должен трогать инфру), а не
+    # только отображение результата.
+    local category_filter="${3:-}"
     local tmp_dir; tmp_dir=$(mktemp -d)
 
     # Читаем базу флота СРАЗУ в массив, а не в while-read с фоновыми ssh
@@ -147,10 +158,14 @@ _skynet_run_plugin_on_fleet_parallel_capture() {
     done < "$FLEET_DATABASE_FILE"
 
     local -a pids=()
-    local i=0 name user ip port key_path sudo_pass
+    local i=0 name user ip port key_path sudo_pass category
     for line in "${lines[@]}"; do
-        IFS='|' read -r name user ip port key_path sudo_pass <<< "$line"
+        IFS='|' read -r name user ip port key_path sudo_pass category <<< "$line"
         [[ -z "$name" ]] && continue
+        category=$(_skynet_norm_category "$category")
+        if [[ -n "$category_filter" && "$category" != "$category_filter" ]]; then
+            continue
+        fi
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
         (
@@ -342,16 +357,16 @@ _run_fleet_command() {
             local servers=(); local idx=1
             echo ""
             printf_info "Доступные серверы:"
-            while IFS='|' read -r name user ip port key_path sudo_pass; do
-                servers[$idx]="$name|$user|$ip|$port|$key_path|$sudo_pass"
-                printf "   [%d] %s (%s@%s:%s)\n" "$idx" "$name" "$user" "$ip" "$port"
+            while IFS='|' read -r name user ip port key_path sudo_pass category; do
+                servers[$idx]="$name|$user|$ip|$port|$key_path|$sudo_pass|$category"
+                printf "   [%d] %s (%s@%s:%s) [%s]\n" "$idx" "$name" "$user" "$ip" "$port" "$(_skynet_category_label "$category")"
                 ((idx++))
             done < "$FLEET_DATABASE_FILE"
 
             local s_choice
             s_choice=$(ask_number_in_range "Номер сервера: " 1 "$((idx-1))" "") || continue
             if [[ -n "${servers[$s_choice]:-}" ]]; then
-                IFS='|' read -r name user ip port key_path sudo_pass <<< "${servers[$s_choice]}"
+                IFS='|' read -r name user ip port key_path sudo_pass category <<< "${servers[$s_choice]}"
                 printf_warning "Команда '${selected_plugin##*/}' будет выполнена на сервере '$name'."
                 if ask_yes_no "Начать? (y/n): " "n"; then
                     _skynet_run_plugin_on_server "$selected_plugin" "$name" "$user" "$ip" "$port" "$key_path" "$sudo_pass"

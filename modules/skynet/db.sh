@@ -33,6 +33,23 @@ _skynet_is_local_newer() {
     return 1
 }
 
+# Категория сервера - 7-е поле записи, появилось позже остальных. У старых
+# записей (без поля вовсе) его просто нет - вызывающая сторона получает
+# пустую строку и обязана трактовать её как "fleet" (см. _skynet_norm_category).
+# Список закрытый: любое незнакомое значение (ручная правка через [m])
+# тоже откатывается на "fleet", а не ломает подсчёты.
+_skynet_norm_category() {
+    [[ "$1" == "infra" ]] && { echo "infra"; return; }
+    echo "fleet"
+}
+
+_skynet_category_label() {
+    case "$(_skynet_norm_category "$1")" in
+        infra) echo "Инфра" ;;
+        *)     echo "Флот" ;;
+    esac
+}
+
 _sanitize_fleet_database() {
     if [ -f "$FLEET_DATABASE_FILE" ]; then
         local original_file="$FLEET_DATABASE_FILE"
@@ -40,8 +57,8 @@ _sanitize_fleet_database() {
         local modified_count=0
 
         # Read original file line by line
-        while IFS='|' read -r name user ip port key_path sudo_pass; do
-            local current_line="$name|$user|$ip|$port|$key_path|$sudo_pass"
+        while IFS='|' read -r name user ip port key_path sudo_pass category; do
+            local current_line="$name|$user|$ip|$port|$key_path|$sudo_pass|$category"
             local new_key_path="$key_path"
 
             # Check if it's an old-style unique key and needs migration
@@ -61,7 +78,7 @@ _sanitize_fleet_database() {
                     new_key_path=$(_generate_unique_key "$name" "$ip") >/dev/null # Suppress stdout
                     modified_count=$((modified_count + 1))
                     printf_info "Migrated key path for '${name}' (old: ${key_path}, new: ${new_key_path})" >&2
-                    current_line="$name|$user|$ip|$port|$new_key_path|$sudo_pass"
+                    current_line="$name|$user|$ip|$port|$new_key_path|$sudo_pass|$category"
                 fi
             fi
             echo "$current_line" >> "$temp_file"
@@ -78,15 +95,18 @@ _sanitize_fleet_database() {
         # Original cleanup logic (remove empty lines and invalid entries)
         sed -i '/^$/d' "$FLEET_DATABASE_FILE"
 
+        # Заодно нормализуем категорию: старые записи без 7-го поля получают
+        # явный "fleet", чтобы дальше по коду можно было просто читать поле
+        # как есть, а не гадать "пусто = fleet" в каждом месте.
         local tmp_filter=$(mktemp)
-        while IFS='|' read -r name user ip port key_path sudo_pass; do
+        while IFS='|' read -r name user ip port key_path sudo_pass category; do
             if [[ -z "$name" ]] || [[ "$name" == $'\e'* ]]; then
                 continue
             fi
             if [[ -z "$ip" ]]; then
                 continue
             fi
-            echo "$name|$user|$ip|$port|$key_path|$sudo_pass" >> "$tmp_filter"
+            echo "$name|$user|$ip|$port|$key_path|$sudo_pass|$(_skynet_norm_category "$category")" >> "$tmp_filter"
         done < "$FLEET_DATABASE_FILE"
         mv "$tmp_filter" "$FLEET_DATABASE_FILE"
     fi
@@ -110,13 +130,13 @@ _remove_key_path_from_fleet_db() {
         return # No database to update
     fi
 
-    while IFS='|' read -r name user ip port key_path sudo_pass; do
+    while IFS='|' read -r name user ip port key_path sudo_pass category; do
         if [[ "$key_path" == "$deleted_key_path" ]]; then
             # Found a matching entry, remove the key_path
-            echo "$name|$user|$ip|$port||$sudo_pass" >> "$temp_file"
+            echo "$name|$user|$ip|$port||$sudo_pass|$category" >> "$temp_file"
             modified_count=$((modified_count + 1))
         else
-            echo "$name|$user|$ip|$port|$key_path|$sudo_pass" >> "$temp_file"
+            echo "$name|$user|$ip|$port|$key_path|$sudo_pass|$category" >> "$temp_file"
         fi
     done < "$original_file"
 
@@ -126,4 +146,20 @@ _remove_key_path_from_fleet_db() {
     else
         rm "$temp_file"
     fi
+}
+
+# Считает серверы флота нужной категории ("fleet" | "infra"). Используется
+# там, где счётчик должен совпадать с тем, что реально попадёт в выборку
+# (замер вместимости флота, оценка стоимости прогона ТСПУ и т.п.) - обычный
+# `grep -c . "$FLEET_DATABASE_FILE"` считает вообще все записи.
+_skynet_fleet_count_by_category() {
+    local want="$1"
+    [[ -f "$FLEET_DATABASE_FILE" ]] || { echo 0; return; }
+
+    local name user ip port key_path sudo_pass category count=0
+    while IFS='|' read -r name user ip port key_path sudo_pass category; do
+        [[ -z "$name" ]] && continue
+        [[ "$(_skynet_norm_category "$category")" == "$want" ]] && ((count++))
+    done < "$FLEET_DATABASE_FILE"
+    echo "$count"
 }
