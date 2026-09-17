@@ -737,7 +737,64 @@ _skynet_censorcheck_run_and_report() {
     clean_list="${clean_list%, }"
     local hit_cities=${#city_servers[@]}
 
-    local report="<tg-emoji emoji-id=\"5474410313853998290\">💡</tg-emoji> <b>Блокировка ТСПУ — отчёт по флоту</b>"$'\n\n'"<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
+    # Сводка в процентах. Доступность по флоту считается по зондам, а не как
+    # среднее из процентов серверов: у сервера, который не удалось померить,
+    # процента нет вовсе, и он не должен тянуть среднее ни вверх, ни вниз.
+    local measured=$(( ok_n + blocked_n ))
+    local infra_measured=$(( infra_ok_n + infra_blocked_n ))
+
+    # Вердикт-эмодзи идёт первым символом заголовка — виден даже в превью
+    # пуша, без открытия Telegram. Блокировка инфры (control-plane, не
+    # VPN-нода) сразу красная, даже если по флоту почти всё чисто - там
+    # молчание значит панель/нода недоступна, а не просто урезанный канал.
+    local verdict_emoji verdict_text
+    if [[ "$measured" -eq 0 && "$infra_measured" -eq 0 ]]; then
+        verdict_emoji="⚪"
+        verdict_text="нет данных"
+    elif [[ "$blocked_n" -eq 0 && "$infra_blocked_n" -eq 0 ]]; then
+        verdict_emoji="🟢"
+        verdict_text="всё чисто"
+    elif [[ "$infra_blocked_n" -gt 0 ]] || { [[ "$measured" -gt 0 ]] && (( blocked_n * 2 >= measured )); }; then
+        verdict_emoji="🔴"
+        verdict_text="серьёзные блокировки"
+    else
+        verdict_emoji="🟡"
+        verdict_text="есть блокировки"
+    fi
+
+    local report="${verdict_emoji} <b>Блокировка ТСПУ — ${verdict_text}</b>"$'\n\n'"<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
+
+    # Сводка поднята сразу под заголовок и в НЕразворачиваемой цитате -
+    # главное видно без единого клика, детали (кто именно и где) остаются
+    # ниже по тем же сворачиваемым блокам, что и раньше.
+    local summary_block="📊 <b>Сводка</b>"$'\n'
+    if [[ "$fleet_total" -gt 0 ]]; then
+        # "Без учёта инфры" явно проговариваем: зонды инфра-серверов сюда не
+        # входят (у инфры отдельный вердикт по 60%-порогу, а не по зондам).
+        summary_block+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
+        summary_block+="• Серверов с блокировками: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
+        if [[ "$city_n" -gt 0 ]]; then
+            summary_block+="• Городов с блокировками: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
+        fi
+    else
+        # Ни одного удавшегося замера: показывать 100% доступности здесь было
+        # бы прямой ложью.
+        summary_block+="• Доступность по флоту: <b>нет данных</b>"$'\n'
+    fi
+    [[ "$skip_n" -gt 0 ]] && summary_block+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
+    [[ "$excluded_n" -gt 0 ]] && summary_block+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
+    if [[ -n "$infra_list" ]]; then
+        if [[ "$infra_measured" -gt 0 ]]; then
+            summary_block+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> доступно"
+            [[ "$infra_skip_n" -gt 0 ]] && summary_block+=" (${infra_skip_n} требует проверки)"
+            summary_block+=$'\n'
+        else
+            summary_block+="• Инфра: <b>нет данных</b> (${infra_skip_n} требует проверки)"$'\n'
+        fi
+    fi
+    summary_block="${summary_block%$'\n'}"
+
+    report+=$'\n'"<blockquote>${summary_block}</blockquote>"$'\n'
 
     if [[ -n "$ok_list" ]]; then
         report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Доступно (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
@@ -770,38 +827,6 @@ _skynet_censorcheck_run_and_report() {
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Блокировки по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
         [[ -n "$clean_list" ]] && report+=$'\n'"<i>Чисто: ${clean_list}</i>"$'\n'
         report+="</blockquote>"$'\n'
-    fi
-
-    # Сводка в процентах. Доступность по флоту считается по зондам, а не как
-    # среднее из процентов серверов: у сервера, который не удалось померить,
-    # процента нет вовсе, и он не должен тянуть среднее ни вверх, ни вниз.
-    local measured=$(( ok_n + blocked_n ))
-
-    report+=$'\n'"📊 <b>Сводка</b>"$'\n'
-    if [[ "$fleet_total" -gt 0 ]]; then
-        # "Без учёта инфры" явно проговариваем: зонды инфра-серверов сюда не
-        # входят (у инфры отдельный вердикт по 60%-порогу, а не по зондам).
-        report+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
-        report+="• Серверов с блокировками: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
-        if [[ "$city_n" -gt 0 ]]; then
-            report+="• Городов с блокировками: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
-        fi
-    else
-        # Ни одного удавшегося замера: показывать 100% доступности здесь было
-        # бы прямой ложью.
-        report+="• Доступность по флоту: <b>нет данных</b>"$'\n'
-    fi
-    [[ "$skip_n" -gt 0 ]] && report+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
-    [[ "$excluded_n" -gt 0 ]] && report+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
-    if [[ -n "$infra_list" ]]; then
-        local infra_measured=$(( infra_ok_n + infra_blocked_n ))
-        if [[ "$infra_measured" -gt 0 ]]; then
-            report+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> доступно"
-            [[ "$infra_skip_n" -gt 0 ]] && report+=" (${infra_skip_n} требует проверки)"
-            report+=$'\n'
-        else
-            report+="• Инфра: <b>нет данных</b> (${infra_skip_n} требует проверки)"$'\n'
-        fi
     fi
 
     if _skynet_censorcheck_tg_send "$report"; then
