@@ -634,7 +634,10 @@ _skynet_censorcheck_run_and_report() {
         local _c miss pct asns city
         while read -r _c miss pct asns city; do
             [[ -n "$city" ]] || continue
-            city_servers["$city"]+="${short_name} (${pct}%), "
+            # Каждый сервер - отдельной строкой (не через запятую): в городах
+            # с несколькими заблокированными серверами список иначе сливался
+            # в нечитаемый абзац.
+            city_servers["$city"]+="${short_name} (${pct}%)"$'\n'
             [[ "$asns" != "-" ]] && city_asns["$city"]+="${asns},"
         done < <(grep '^CITY ' "${tmp_dir}/${idx}.result" 2>/dev/null)
     done
@@ -681,8 +684,20 @@ _skynet_censorcheck_run_and_report() {
         done
         ops="${ops%, }"
 
-        geo_list+="• <b>${esc_city}</b> — ${city_servers[$city]%, }${ops:+ · ${ops}}"$'\n'
+        # Город + операторы одной строкой-шапкой, каждый сервер - своей
+        # строкой с отступом и "↳" (не через запятую при городе, как раньше -
+        # это разваливалось на экране при 4-5 серверах).
+        geo_list+="• <b>${esc_city}</b>${ops:+ — ${ops}}"$'\n'
+        local city_server_line
+        while IFS= read -r city_server_line; do
+            [[ -n "$city_server_line" ]] || continue
+            geo_list+="  ↳ ${city_server_line}"$'\n'
+        done <<< "${city_servers[$city]}"
+        geo_list+=$'\n'
     done
+    # Последний город не должен тащить за собой лишнюю пустую строку перед
+    # закрывающим тегом blockquote.
+    geo_list="${geo_list%$'\n'}"
     clean_list="${clean_list%, }"
     local hit_cities=${#city_servers[@]}
 
