@@ -360,6 +360,15 @@ _skynet_tspu_infra_save_state() {
         printf 'SKIP=%s\n' "$skip"
         printf '%s' "$lines"
     } > "$_TSPU_INFRA_STATE_FILE" 2>/dev/null
+
+    # Виджет 05_infra_tspu.sh на дашборде кэширует свой рендер по TTL
+    # (modules/ui/dashboard.sh, WIDGET_CACHE_DIR), а не по mtime этого файла
+    # состояния. Без явного сброса дашборд после свежей проверки ещё до
+    # DASHBOARD_WIDGET_CACHE_TTL_ADJ (60с, x2/x4 на light/ultra_light) будет
+    # показывать старый результат — рвём кэш сразу, чтобы "Решала" подхватил
+    # новые данные при следующем же открытии, а не только после ручной
+    # очистки кэша виджетов.
+    rm -f "/tmp/reshala_widgets_cache/05_infra_tspu.sh.cache" 2>/dev/null || true
 }
 
 # Итог по одному серверу. Читает <tmp_dir>/<idx>.out, оставленный
