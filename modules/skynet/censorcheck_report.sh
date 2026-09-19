@@ -151,9 +151,16 @@ _skynet_censorcheck_tg_send_chunk() {
     local text="$1"
     local token="${TG_BOT_TOKEN:-}"
     local chat_id="${TG_CHAT_ID:-}"
+    local topic_id="${TG_TOPIC_ID:-}"
+
+    # message_thread_id нужен только для групп с включёнными «Темами» (топиками):
+    # без него сообщение уходит в General. Пустой TG_TOPIC_ID — старое поведение.
+    local -a topic_args=()
+    [[ -n "$topic_id" ]] && topic_args=(--data-urlencode "message_thread_id=${topic_id}")
 
     curl -s -m 20 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
+        ${topic_args[@]+"${topic_args[@]}"} \
         --data-urlencode "text=${text}" \
         --data-urlencode "parse_mode=HTML" \
         -o /dev/null -w '%{http_code}'
@@ -200,6 +207,8 @@ _skynet_censorcheck_configure_telegram() {
     printf_description "3. Откройте в браузере (замените <TOKEN> на свой):"
     printf_description "   https://api.telegram.org/bot<TOKEN>/getUpdates"
     printf_description "4. Найдите там \"chat\":{\"id\":ЧИСЛО — это ваш TG_CHAT_ID."
+    printf_description "5. Для группы с топиками: TG_TOPIC_ID — это message_thread_id из getUpdates"
+    printf_description "   (или число из ссылки на сообщение: t.me/c/<чат>/<ТОПИК>/<сообщение>)."
     echo ""
     printf_description "Хранится в ${C_CYAN}${RESHALA_ENV_FILE}${C_RESET} (права 600), не в общем конфиге."
     echo ""
@@ -222,12 +231,26 @@ _skynet_censorcheck_configure_telegram() {
 
     local chat_id; chat_id=$(ask_non_empty "TG_CHAT_ID" "${TG_CHAT_ID:-}") || return
 
+    # Топик необязателен. Пустой ввод оставляет прежнее значение, «-» сбрасывает
+    # его (отчёты пойдут в основной чат/General).
+    local topic_id
+    topic_id=$(safe_read "TG_TOPIC_ID (необязательно, «-» — сбросить)" "${TG_TOPIC_ID:-}") || return
+    if [[ "$topic_id" == "-" ]]; then
+        topic_id=""
+    elif [[ -n "$topic_id" && ! "$topic_id" =~ ^[0-9]+$ ]]; then
+        printf_error "TG_TOPIC_ID должен быть числом."
+        wait_for_enter
+        return
+    fi
+
     # Храним в /etc/reshala/.env (см. common.sh), а не в config/reshala.conf:
     # это секрет, и он должен пережить переустановку/обновление Решалы.
     set_env_var "TG_BOT_TOKEN" "$token"
     set_env_var "TG_CHAT_ID" "$chat_id"
+    set_env_var "TG_TOPIC_ID" "$topic_id"
     TG_BOT_TOKEN="$token"
     TG_CHAT_ID="$chat_id"
+    TG_TOPIC_ID="$topic_id"
 
     printf_info "Отправляю тестовое сообщение..."
     if _skynet_censorcheck_tg_send "✅ Решала: Telegram настроен. Сюда будут приходить отчёты «Блокировка ТСПУ»."; then
