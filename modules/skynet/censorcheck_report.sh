@@ -158,12 +158,25 @@ _skynet_censorcheck_tg_send_chunk() {
     local -a topic_args=()
     [[ -n "$topic_id" ]] && topic_args=(--data-urlencode "message_thread_id=${topic_id}")
 
-    curl -s -m 20 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+    # Тело ответа держим отдельно от кода: при ошибке Telegram присылает
+    # причину текстом ("can't parse entities: ..." и т.п.) - без неё
+    # ОШИБКА в логе означает только "не удалось", без единой зацепки, что
+    # чинить.
+    local body_file; body_file=$(mktemp)
+    local http_code
+    http_code=$(curl -s -m 20 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         ${topic_args[@]+"${topic_args[@]}"} \
         --data-urlencode "text=${text}" \
         --data-urlencode "parse_mode=HTML" \
-        -o /dev/null -w '%{http_code}'
+        -o "$body_file" -w '%{http_code}')
+
+    if [[ "$http_code" != "200" ]]; then
+        log "CensorCheck: Telegram ответил ${http_code}: $(tr -d '\n' < "$body_file" | cut -c1-500)"
+    fi
+    rm -f "$body_file"
+
+    printf '%s' "$http_code"
 }
 
 # Отправляет произвольно длинный текст, разбивая его на несколько
