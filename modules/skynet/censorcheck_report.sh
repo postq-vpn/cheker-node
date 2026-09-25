@@ -202,9 +202,12 @@ _skynet_censorcheck_tg_send() {
     local chunk="" all_ok=0 http_code
     local depth=0 line
 
+    # "< <(printf ...)", а не "<<< "$full_text"": here-string дописывает свой
+    # собственный "\n" в конец, а $full_text и так уже кончается на "\n" -
+    # на выходе лишняя пустая "строка", которая при многочастевой отправке
+    # улетает Telegram отдельным пустым сообщением ("text must be non-empty").
     while IFS= read -r line; do
         if (( depth == 0 )) && (( ${#chunk} + ${#line} + 1 > max_len )) && [[ -n "$chunk" ]]; then
-            log "CensorCheck: DEBUG отправляю чанк len=${#chunk} preview=[$(printf '%s' "$chunk" | head -c 60 | tr '\n' '|')]"
             http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
             [[ "$http_code" != "200" ]] && all_ok=1
             chunk=""
@@ -214,10 +217,9 @@ _skynet_censorcheck_tg_send() {
         case "$line" in *'</blockquote>'*) depth=$((depth - 1)) ;; esac
         case "$line" in *'<blockquote'*) depth=$((depth + 1)) ;; esac
         (( depth < 0 )) && depth=0
-    done <<< "$full_text"
+    done < <(printf '%s' "$full_text")
 
     if [[ -n "$chunk" ]]; then
-        log "CensorCheck: DEBUG отправляю финальный чанк len=${#chunk} preview=[$(printf '%s' "$chunk" | head -c 60 | tr '\n' '|')]"
         http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
         [[ "$http_code" != "200" ]] && all_ok=1
     fi
