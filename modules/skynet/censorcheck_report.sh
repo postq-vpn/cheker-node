@@ -51,21 +51,71 @@ _CENSORCHECK_CREDITS_PER_PROBE=10
 # RESHALA_TZ_OFFSET_MIN из config/reshala.conf), а не по часовому поясу
 # сервера: у VPS это почти всегда UTC, и отчёт приходил на 3 часа позже.
 
-# Те же ASN российских операторов, что и в исходном censorcheck.sh -
-# только для перевода номера ASN в человекочитаемое имя в отчёте.
+# ASN -> имя оператора по-русски для отчёта. Покрывает все сети из
+# CONSUMER_ASNS в tspu_probe.py (то есть всю выборку по умолчанию) и
+# мобильные. Чего здесь нет - в отчёт идёт имя держателя ASN из RIPEstat
+# (латиницей), так что новую сеть из TSPU_EXTRA_ASNS стоит дописать сюда.
+# У крупных операторов по нескольку ASN - имя одно, и в строке города
+# повторы схлопываются.
 declare -A _TSPU_ASN_NAMES=(
-    [12389]="Ростелеком"
-    [8402]="Билайн"
+    # Ростелеком
+    [12389]="Ростелеком" [42610]="Ростелеком" [25515]="Ростелеком"
+    [35125]="Ростелеком" [8997]="Ростелеком" [21479]="Ростелеком"
+    [25490]="Ростелеком"
+    [21127]="ЗСТТК"
+    # Билайн
+    [3216]="Билайн" [8402]="Билайн" [42842]="Билайн" [16345]="Билайн"
+    # МТС и МГТС
+    [8359]="МТС" [13055]="МТС" [8580]="МТС" [197023]="МТС"
+    [28884]="МТС" [13174]="МТС"
     [25513]="МГТС"
-    [8359]="МТС"
-    [3216]="Билайн"
-    [20485]="ТТК"
-    [25490]="РТК-Юг"
-    [43727]="Мегафон"
-    [12714]="Мегафон"
-    [34757]="Sib Seti"
-    [29124]="Iskratelecom"
-    [12768]="Дом.ру"
+    # Мегафон
+    [12714]="Мегафон" [20632]="Мегафон" [31133]="Мегафон" [31163]="Мегафон"
+    [31213]="Мегафон" [31224]="Мегафон" [25159]="Мегафон"
+    # T2
+    [15378]="T2" [12958]="T2" [41330]="T2"
+    # ТТК
+    [20485]="ТТК" [15774]="ТТК"
+    # Дом.ру (ЭР-Телеком) - по ASN на регион
+    [12768]="Дом.ру" [51604]="Дом.ру" [41733]="Дом.ру" [57378]="Дом.ру"
+    [50543]="Дом.ру" [5563]="Дом.ру" [34533]="Дом.ру" [51645]="Дом.ру"
+    [50544]="Дом.ру" [39435]="Дом.ру" [51035]="Дом.ру" [52207]="Дом.ру"
+    [201825]="Дом.ру" [39927]="Дом.ру" [48642]="Дом.ру" [60139]="Дом.ру"
+    # Региональные операторы
+    [24955]="Уфанет"
+    [8369]="Интерсвязь"
+    [31200]="Новотелеком"
+    [21087]="Электронный город"
+    [34757]="Сибирские сети"
+    [29124]="Искрателеком"
+    [35807]="SkyNet"
+    [15582]="Акадо"
+    [8492]="Обит"
+    [28840]="Таттелеком"
+    [58002]="Связьинформ"
+    [15974]="ТрансТел" [8427]="ТрансТел"
+    [43727]="Квант-Телеком" [44604]="Квант-Телеком"
+    [5547]="Ориент-Телеком"
+    [13178]="Реал-нет"
+    [15930]="Wipline"
+    [12668]="КомТехЦентр"
+    [28890]="Инсис"
+    [49469]="Мелт-Интернет"
+    [47165]="Омские кабельные сети"
+    [15870]="БС-Телеком"
+    [57494]="Адман"
+    [51724]="Флайнет"
+    [57781]="Яртелесервис"
+    [44507]="Костромская ГТС"
+    [44552]="Альтура"
+    [60246]="ПГ-19"
+    [42893]="Домашний интернет"
+    [42668]="Невалинк"
+    [24739]="Северен-Телеком"
+    [47236]="Ситилинк"
+    [48969]="Парус-Телеком"
+    # Мобильные зонды вне списка
+    [47379]="СИТС (LTE Мегафон)"
 )
 
 # ============================================================ #
@@ -353,6 +403,9 @@ _skynet_tspu_py() {
     TSPU_CITY_PROBES="${TSPU_CITY_PROBES:-5}" \
     TSPU_CITY_MIN_PROBES="${TSPU_CITY_MIN_PROBES:-5}" \
     TSPU_PROBE_STRICT_GEO="${TSPU_PROBE_STRICT_GEO:-0}" \
+    TSPU_CONSUMER_ONLY="${TSPU_CONSUMER_ONLY:-1}" \
+    TSPU_EXTRA_ASNS="${TSPU_EXTRA_ASNS:-}" \
+    TSPU_MOBILE_PROBES="${TSPU_MOBILE_PROBES:-1}" \
     TSPU_CONTROL_IP="${TSPU_CONTROL_IP:-}" \
     TSPU_CONTROL_SNI="${TSPU_CONTROL_SNI:-}" \
     python3 "$_TSPU_PROBE_SCRIPT" "$@"
@@ -362,6 +415,7 @@ _skynet_tspu_py() {
 #   OK <percent> <success> <total> <fault> <dead> <noise>
 #   ASN <asn> <сколько зондов подтверждённо не дошло>   (0..N строк)
 #   CITY <успешно> <всего> <asn,asn|-> <город>          (0..N строк)
+#   MOBILE <успешно> <всего> <asn,asn|->                (0..1 строка)
 # либо одну строку:
 #   SKIP <причина>
 #
@@ -428,6 +482,7 @@ _skynet_tspu_infra_save_state() {
 #   AVAILABLE|BLOCKED|SKIP <детали>              - ровно одна первая строка
 #   STAT <успешно> <всего>                        - для сводки по флоту
 #   CITY <промахов> <процент> <asn,asn|-> <город> - 0..N, только проблемные
+#   MOBILE <промахов> <процент> <asn,asn|->       - 0..1, мобильные зонды
 #
 # Подтверждение промаха живёт в tspu_probe.py: сюда приходят уже только те
 # зонды, которые не достучались ДВАЖДЫ и при этом доказали, что живы. Поэтому
@@ -495,6 +550,14 @@ _skynet_tspu_summarize_server() {
         [[ "$c_tot" -gt 0 ]] && c_pct=$(( c_ok * 100 / c_tot ))
         echo "CITY $(( c_tot - c_ok )) ${c_pct} ${c_asns} ${c_name}"
     done < <(grep '^CITY ' "$file") | sort -t' ' -k3,3n
+
+    # Мобильные зонды - отдельной строкой, в города не смешиваются:
+    #   MOBILE <промахов> <процент> <asn,asn|->
+    local _m m_ok m_tot m_asns
+    read -r _m m_ok m_tot m_asns < <(grep '^MOBILE ' "$file")
+    if [[ -n "${m_tot:-}" && "$m_tot" -gt 0 ]]; then
+        echo "MOBILE $(( m_tot - m_ok )) $(( m_ok * 100 / m_tot )) ${m_asns}"
+    fi
 }
 
 # Прогоняет весь флот (без SSH, напрямую по IP из базы флота). Результаты -
@@ -615,6 +678,11 @@ _skynet_censorcheck_run_and_report() {
     local -a all_cities=()
     mapfile -t all_cities < <(echo "$probes_out" | sed -n 's/^CITY [0-9]* //p')
 
+    # Мобильные зонды выборки: "<asn> <место|->" по строке на зонд.
+    local -a mobile_probes=()
+    mapfile -t mobile_probes < <(echo "$probes_out" | sed -n 's/^MOBILE //p')
+    local mobile_n=${#mobile_probes[@]}
+
     # В режиме common городов нет: и строка о выборке, и раздел с географией
     # в отчёте отличаются только этим.
     local sample_line="${probe_n} $(_skynet_censorcheck_plural "$probe_n" зонд зонда зондов)"
@@ -622,6 +690,9 @@ _skynet_censorcheck_run_and_report() {
         sample_line+=" в ${city_n} $(_skynet_censorcheck_plural "$city_n" городе городах городах)"
     else
         sample_line+=" в сетях крупных операторов"
+    fi
+    if [[ "$mobile_n" -gt 0 ]]; then
+        sample_line+=", из них ${mobile_n} $(_skynet_censorcheck_plural "$mobile_n" мобильный мобильных мобильных)"
     fi
 
     if [[ "$verbose" -eq 1 ]]; then
@@ -655,6 +726,10 @@ _skynet_censorcheck_run_and_report() {
     # Город -> кто в нём недоступен и чьи это сети. Ключ с пробелом внутри
     # ("Нижний Новгород") ассоциативному массиву не мешает.
     local -A city_servers=() city_asns=()
+
+    # Мобильная сеть - по каждому серверу основного флота, который мобильные
+    # зонды вообще померили: и доступные, и заблокированные.
+    local mobile_list="" mobile_ok_n=0 mobile_blocked_n=0
 
     # Сервер попадает "под замену", когда режется не в одном городе, а
     # системно: заблокирован минимум в TSPU_REPLACE_CITY_SHARE% городов
@@ -746,6 +821,20 @@ _skynet_censorcheck_run_and_report() {
             server_pct_sum=$((server_pct_sum + pct))
         done < <(grep '^CITY ' "${tmp_dir}/${idx}.result" 2>/dev/null)
 
+        local _m m_miss m_pct m_asns
+        read -r _m m_miss m_pct m_asns < <(grep '^MOBILE ' "${tmp_dir}/${idx}.result" 2>/dev/null)
+        if [[ -n "${m_miss:-}" ]]; then
+            if [[ "$m_miss" -eq 0 ]]; then
+                mobile_ok_n=$((mobile_ok_n + 1))
+                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
+            else
+                # Операторов подставим ниже, когда будут загружены их имена:
+                # "@@MOB:<asn,asn>@@" заменяется на " — Билайн".
+                mobile_blocked_n=$((mobile_blocked_n + 1))
+                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> доступно ${m_pct}%@@MOB:${m_asns}@@"$'\n'
+            fi
+        fi
+
         # "Под замену": режется системно, не в одном случайном городе -
         # доля городов с подтверждённым промахом и средняя доступность по
         # ним обе должны перевалить за порог.
@@ -785,6 +874,40 @@ _skynet_censorcheck_run_and_report() {
         asn_titles[$a_num]="$a_name"
     done < <(_skynet_tspu_py asnnames 2>/dev/null)
 
+    # Подпись мобильной выборки: "СИТС, Москва ×2; Билайн, Новосибирск" -
+    # одинаковые зонды схлопываются, порядок - как в выборке.
+    local mobile_where="" m_line m_asn m_place op
+    local -a m_order=()
+    local -A m_count=()
+    for m_line in "${mobile_probes[@]}"; do
+        read -r m_asn m_place <<< "$m_line"
+        op="${_TSPU_ASN_NAMES[$m_asn]:-${asn_titles[$m_asn]:-AS$m_asn}}"
+        [[ "$m_place" != "-" ]] && op+=", ${m_place}"
+        [[ -z "${m_count[$op]:-}" ]] && m_order+=("$op")
+        m_count[$op]=$(( ${m_count[$op]:-0} + 1 ))
+    done
+    for op in "${m_order[@]}"; do
+        mobile_where+="$(_skynet_censorcheck_html_escape "$op")"
+        [[ "${m_count[$op]}" -gt 1 ]] && mobile_where+=" ×${m_count[$op]}"
+        mobile_where+="; "
+    done
+    mobile_where="${mobile_where%; }"
+
+    # Кто режет в мобильной сети - имена операторов вместо меток @@MOB:...@@.
+    local m_tag m_ops
+    while [[ "$mobile_list" =~ @@MOB:([0-9,-]*)@@ ]]; do
+        m_tag="${BASH_REMATCH[0]}" m_ops=""
+        for m_asn in $(printf '%s' "${BASH_REMATCH[1]}" | tr ',' '\n' | sort -un); do
+            [[ "$m_asn" =~ ^[0-9]+$ ]] || continue
+            op="${_TSPU_ASN_NAMES[$m_asn]:-${asn_titles[$m_asn]:-AS$m_asn}}"
+            op="$(_skynet_censorcheck_html_escape "$op")"
+            [[ ", ${m_ops}" == *", ${op}, "* ]] && continue
+            m_ops+="${op}, "
+        done
+        m_ops="${m_ops%, }"
+        mobile_list="${mobile_list/"$m_tag"/${m_ops:+ — ${m_ops}}}"
+    done
+
     local geo_list="" clean_list="" city ops op
     for city in "${all_cities[@]}"; do
         [[ -n "$city" ]] || continue
@@ -796,11 +919,16 @@ _skynet_censorcheck_run_and_report() {
         fi
 
         ops=""
+        local -A seen_ops=()
         for a_num in $(printf '%s' "${city_asns[$city]%,}" | tr ',' '\n' | sort -un); do
             [[ -n "$a_num" ]] || continue
             op="${_TSPU_ASN_NAMES[$a_num]:-${asn_titles[$a_num]:-AS$a_num}}"
+            # У Билайна, Ростелекома, Дом.ру по нескольку ASN - имя одно.
+            [[ -n "${seen_ops[$op]:-}" ]] && continue
+            seen_ops[$op]=1
             ops+="$(_skynet_censorcheck_html_escape "$op"), "
         done
+        unset seen_ops
         ops="${ops%, }"
 
         # Город + операторы одной строкой-шапкой, каждый сервер - своей
@@ -864,6 +992,10 @@ _skynet_censorcheck_run_and_report() {
         # бы прямой ложью.
         summary_block+="• Доступность по флоту: <b>нет данных</b>"$'\n'
     fi
+    local mobile_measured=$(( mobile_ok_n + mobile_blocked_n ))
+    if [[ "$mobile_measured" -gt 0 ]]; then
+        summary_block+="• Мобильная сеть: <b>${mobile_ok_n} из ${mobile_measured}</b> серверов доступно"$'\n'
+    fi
     [[ "$skip_n" -gt 0 ]] && summary_block+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
     [[ "$excluded_n" -gt 0 ]] && summary_block+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
     if [[ -n "$infra_list" ]]; then
@@ -914,6 +1046,14 @@ _skynet_censorcheck_run_and_report() {
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Блокировки по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
         [[ -n "$clean_list" ]] && report+=$'\n'"<i>Чисто: ${clean_list}</i>"$'\n'
         report+="</blockquote>"$'\n'
+    fi
+
+    # Мобильная сеть - свой сворачиваемый блок по каждому серверу. Зондов в
+    # мобильных сетях единицы, поэтому в шапке прямо сказано, чьи и где:
+    # это сигнал с конкретной сети, а не статистика по стране.
+    if [[ -n "$mobile_list" ]]; then
+        mobile_list="${mobile_list%$'\n'}"
+        report+=$'\n'"<blockquote expandable>📱 <b>Мобильная сеть (${mobile_ok_n} из ${mobile_measured} доступно):</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
     fi
 
     if _skynet_censorcheck_tg_send "$report"; then
@@ -1163,6 +1303,15 @@ _skynet_censorcheck_probe_set_menu() {
         else
             printf_description "Зондов: ${C_GREEN}${probe_n}${C_RESET} в сетях крупных операторов"
         fi
+
+        # Мобильные зонды - сверх городских, без квоты: все, какие есть.
+        local m_asn m_place
+        while read -r _p m_asn m_place; do
+            [[ -n "$m_asn" ]] || continue
+            local m_op="${_TSPU_ASN_NAMES[$m_asn]:-AS$m_asn}"
+            [[ "$m_place" != "-" ]] && m_op+=", ${m_place}"
+            printf_description "  • 📱 Мобильная сеть — ${m_op}"
+        done < <(echo "$out" | grep '^MOBILE ')
         echo ""
 
         # Прикидка по кредитам считается по чистому прогону, без блокировок:

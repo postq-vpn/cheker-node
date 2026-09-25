@@ -164,14 +164,87 @@ CITIES = [
     ("Астрахань", 46.35, 48.04),
 ]
 
-# Массовые операторы, у которых ТСПУ и стоит. Внутри города такие ASN берём
-# в выборку первыми: зонд в дата-центре или у корпоративного провайдера
-# может ходить мимо той фильтрации, ради которой всё затевалось.
+# Абонентские сети - мобильные и домашние операторы, у которых ТСПУ и стоит.
+# Зонд у хостера или в корпоративной сети ходит мимо той фильтрации, ради
+# которой всё затевалось, и завышает доступность. Тега datacentre на таких
+# зондах чаще всего нет (Selectel, Baxet, Timeweb, ColoCrossing его не
+# ставят), поэтому по умолчанию берём ТОЛЬКО ASN из этого списка
+# (TSPU_CONSUMER_ONLY=1). Список закрытый намеренно: хостеров сотни и новые
+# появляются каждый месяц, а абонентских операторов с зондами - десятки.
+# Свою сеть можно добавить через TSPU_EXTRA_ASNS, не трогая код.
 CONSUMER_ASNS = {
-    12389, 8402, 25513, 8359, 3216, 20485, 25490, 43727,
-    12714, 34757, 29124, 12768, 8997, 42610, 31133, 21479,
-    35807, 51604, 39927, 41733, 48642, 60139,
+    # Ростелеком (включая региональные ASN и бывший РТК-Юг)
+    12389, 42610, 25515, 25490, 35125, 8997, 21479, 21127,
+    # Билайн
+    3216, 8402, 42842, 16345,
+    # МТС и МГТС
+    8359, 13055, 8580, 197023, 28884, 13174, 25513,
+    # Мегафон (включая NetByNet)
+    12714, 20632, 31133, 31163, 31213, 31224, 25159,
+    # T2 (Tele2)
+    15378, 12958, 41330,
+    # ТТК
+    20485, 15774,
+    # Дом.ру / ЭР-Телеком - у каждого региона свой ASN
+    12768, 51604, 41733, 57378, 50543, 5563, 34533, 51645, 50544,
+    39435, 51035, 52207, 201825, 39927, 48642, 60139,
+    # Крупные региональные операторы
+    24955,  # Уфанет
+    8369,   # Интерсвязь (Челябинск)
+    31200,  # Новотелеком (Новосибирск)
+    21087,  # Электронный город (Новосибирск)
+    34757,  # Сибирские сети
+    29124,  # Искрателеком
+    35807,  # SkyNet (Санкт-Петербург)
+    15582,  # Акадо
+    8492,   # Obit
+    28840,  # Таттелеком
+    58002,  # Связьинформ
+    15974, 8427,  # ТрансТел
+    43727, 44604,  # Квант-Телеком
+    5547,   # Ориент-Телеком
+    # Домашние провайдеры в городах выборки
+    13178,  # Реал-нет (Воронеж)
+    15930,  # Wipline (Воронеж)
+    12668,  # КомТехЦентр (Екатеринбург)
+    28890,  # Инсис (Екатеринбург)
+    49469,  # Мелт-Интернет (Казань)
+    47165,  # Омские кабельные сети
+    15870,  # БС-Телеком (Омск)
+    57494,  # Адман (Новосибирск)
+    51724,  # Флайнет (Томск)
+    57781,  # Яртелесервис (Ярославль)
+    44507,  # Костромская ГТС
+    44552,  # Альтура (Саратов)
+    60246,  # ПГ-19 (Ростов-на-Дону)
+    42893,  # Home Internet (Санкт-Петербург)
+    42668,  # Nevalink (Санкт-Петербург)
+    24739,  # Северен-Телеком (Санкт-Петербург)
+    47236,  # Ситилинк (Петрозаводск)
+    48969,  # Парус-Телеком (Тула)
 }
+
+_EXTRA = os.environ.get("TSPU_EXTRA_ASNS", "")
+CONSUMER_ASNS |= {int(a) for a in _EXTRA.replace(" ", "").split(",") if a.isdigit()}
+
+# 1 - брать зонды только из CONSUMER_ASNS. 0 - как раньше: абонентские сети
+# идут в выборку первыми, но город добирается зондами любых сетей.
+CONSUMER_ONLY = os.environ.get("TSPU_CONSUMER_ONLY", "1") == "1"
+
+# Зонды на мобильном подключении. В мобильных сетях ТСПУ стоит отдельно от
+# домашних, а зондов RIPE Atlas там почти нет (на сентябрь 2026 - один на
+# всю Россию), поэтому их берём ВСЕ, где бы они ни стояли, без квоты и
+# порога города. В городскую статистику они не идут - у них своя строка
+# MOBILE и свой блок в отчёте. Узнаём их по тегам, которые ставит владелец.
+# ASN не проверяем: тег lte хостер на зонд в стойке не поставит.
+#
+# Нужен именно тег радиотехнологии: голый "mobile" владельцы ставят и на
+# проводные зонды (у Ростелекома в Екатеринбурге так). И наоборот, зонд с
+# тегом проводного подключения рядом - не мобильный, даже если "3g" в тегах
+# есть (у Сибирских сетей рядом стоят cable и ftth).
+MOBILE_PROBES = os.environ.get("TSPU_MOBILE_PROBES", "1") == "1"
+MOBILE_TAGS = {"lte", "4g", "5g", "3g"}
+WIRED_TAGS = {"cable", "ftth", "fibre", "fiber", "dsl", "adsl", "vdsl", "ethernet"}
 
 # Режим common: сколько зондов брать в каждой операторской сети. Список и
 # числа - те же, что в исходном censorcheck.tlab.pw. По ряду ASN зондов
@@ -229,8 +302,18 @@ def _nearest_city(lat, lon):
     return None
 
 
+_RU_PROBES = None
+
+
 def fetch_ru_probes():
-    """Все живые публичные зонды в РФ с рабочим IPv4."""
+    """Все живые публичные зонды в РФ с рабочим IPv4.
+
+    Запоминается на время процесса: при пересборке кэша список нужен и
+    городской выборке, и мобильной - качать его дважды незачем.
+    """
+    global _RU_PROBES
+    if _RU_PROBES is not None:
+        return _RU_PROBES
     probes = []
     url = (f"{API}/probes/?country_code=RU&status=1&is_public=true"
            f"&fields=id,asn_v4,geometry,tags&page_size=500")
@@ -238,29 +321,35 @@ def fetch_ru_probes():
         page = _get(url)
         probes.extend(page.get("results", []))
         url = page.get("next")
+    _RU_PROBES = probes
     return probes
 
 
-def _usable_probes():
-    """Живые зонды, годные для замера: рабочий IPv4 и не из стойки."""
+def _usable_probes(skip_ids=()):
+    """Живые зонды, годные для замера: рабочий IPv4, не из стойки и - при
+    CONSUMER_ONLY - только в сетях мобильных и домашних операторов."""
     for p in fetch_ru_probes():
+        if p["id"] in skip_ids:
+            continue
         slugs = {t.get("slug") for t in p.get("tags", [])}
         if "system-ipv4-works" not in slugs:
             continue
         if slugs & EXCLUDE_TAGS:
+            continue
+        if CONSUMER_ONLY and (p.get("asn_v4") or 0) not in CONSUMER_ASNS:
             continue
         if STRICT_GEO and "system-auto-geoip-city" in slugs:
             continue
         yield p, slugs
 
 
-def select_probes_by_asn():
+def select_probes_by_asn(skip_ids=()):
     """Режим common: по несколько зондов в сетях крупных операторов.
 
     Города не размечаются вовсе - в этом режиме отчёт про них и не говорит.
     """
     by_asn = {}
-    for p, _slugs in _usable_probes():
+    for p, _slugs in _usable_probes(skip_ids):
         asn = p.get("asn_v4") or 0
         by_asn.setdefault(asn, []).append({"id": p["id"], "asn": asn, "city": ""})
 
@@ -273,14 +362,14 @@ def select_probes_by_asn():
     return chosen
 
 
-def select_probes():
+def select_probes(skip_ids=()):
     """Режим geo: по CITY_QUOTA зондов в каждом подходящем городе.
 
     Внутри города зонды разных операторов чередуются: три зонда одного
     Ростелекома в Омске покажут одну точку фильтрации, а не город.
     """
     by_city = {}
-    for p, _slugs in _usable_probes():
+    for p, _slugs in _usable_probes(skip_ids):
         geo = (p.get("geometry") or {}).get("coordinates")
         if not geo or len(geo) < 2:
             continue
@@ -328,6 +417,28 @@ def select_probes():
     return chosen
 
 
+def select_mobile_probes():
+    """Все годные зонды на мобильном подключении, без квоты и порога города.
+
+    city пустой намеренно: в городскую статистику и в порог "Под замену"
+    одиночный мобильный зонд не идёт. Где он стоит - в поле place, только
+    для подписи в отчёте.
+    """
+    chosen = []
+    for p in fetch_ru_probes():
+        slugs = {t.get("slug") for t in p.get("tags", [])}
+        if "system-ipv4-works" not in slugs or slugs & EXCLUDE_TAGS:
+            continue
+        if not slugs & MOBILE_TAGS or slugs & WIRED_TAGS:
+            continue
+        geo = (p.get("geometry") or {}).get("coordinates") or []
+        place = _nearest_city(geo[1], geo[0]) if len(geo) >= 2 else None
+        chosen.append({"id": p["id"], "asn": p.get("asn_v4") or 0, "city": "",
+                       "mobile": True, "place": place or ""})
+    chosen.sort(key=lambda c: c["id"])
+    return chosen
+
+
 def asn_holder(asn):
     """Человекочитаемое имя оператора по номеру ASN (RIPEstat).
 
@@ -365,13 +476,22 @@ def load_cache(force=False):
             same_shape = (cached.get("mode") == CHECK_MODE
                           and cached.get("quota") == CITY_QUOTA
                           and cached.get("min_probes") == CITY_MIN_PROBES
-                          and cached.get("strict_geo") == STRICT_GEO)
+                          and cached.get("strict_geo") == STRICT_GEO
+                          and cached.get("consumer_only") == CONSUMER_ONLY
+                          and cached.get("asn_set") == sorted(CONSUMER_ASNS)
+                          and cached.get("mobile") == MOBILE_PROBES)
             if fresh and same_shape and cached.get("probes"):
                 return cached
         except Exception:
             pass
 
-    probes = select_probes_by_asn() if CHECK_MODE == "common" else select_probes()
+    # Мобильные - первыми: иначе LTE-зонд из абонентской сети уйдёт в
+    # городскую квоту и в отчёте потеряется среди проводных.
+    mobile = select_mobile_probes() if MOBILE_PROBES else []
+    skip = {p["id"] for p in mobile}
+    probes = (select_probes_by_asn(skip) if CHECK_MODE == "common"
+              else select_probes(skip))
+    probes += mobile
     names = {}
     for asn in sorted({p["asn"] for p in probes if p["asn"]}):
         holder = asn_holder(asn)
@@ -384,6 +504,9 @@ def load_cache(force=False):
         "quota": CITY_QUOTA,
         "min_probes": CITY_MIN_PROBES,
         "strict_geo": STRICT_GEO,
+        "consumer_only": CONSUMER_ONLY,
+        "asn_set": sorted(CONSUMER_ASNS),
+        "mobile": MOBILE_PROBES,
         "probes": probes,
         "asn_names": names,
     }
@@ -529,6 +652,11 @@ def cmd_probes(api_key, force=False):
     print(f"OK {len(probes)} {len(cities)}")
     for city, count in sorted(cities.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f"CITY {count} {city}")
+    # Мобильные зонды - по строке на зонд: их единицы, и в отчёте каждый
+    # подписывается оператором и местом. Место последним полем (пробелы).
+    for p in probes:
+        if p.get("mobile"):
+            print(f"MOBILE {p['asn']} {p.get('place') or '-'}")
 
 
 def cmd_asnnames():
@@ -620,9 +748,16 @@ def cmd_check(api_key, ip, sni):
     asn_fail = {}
     city_stat = {}          # город -> [успешно, всего]
     city_asn_fail = {}      # город -> {ASN: сколько зондов подтверждённо не дошло}
+    mob_stat = [0, 0]       # мобильные зонды: [успешно, всего]
+    mob_asn_fail = {}
 
     for pid in counted:
         info = meta.get(pid, {})
+        if info.get("mobile"):
+            mob_stat[1] += 1
+            if pid not in confirmed:
+                mob_stat[0] += 1
+            continue
         city = info.get("city")
         if not city:
             continue
@@ -637,6 +772,8 @@ def cmd_check(api_key, ip, sni):
         if not asn:
             continue
         asn_fail[asn] = asn_fail.get(asn, 0) + 1
+        if info.get("mobile"):
+            mob_asn_fail[asn] = mob_asn_fail.get(asn, 0) + 1
         city = info.get("city")
         if city:
             per_city = city_asn_fail.setdefault(city, {})
@@ -655,6 +792,11 @@ def cmd_check(api_key, ip, sni):
         asns = ",".join(str(a) for a, _ in
                         sorted(failed.items(), key=lambda kv: (-kv[1], kv[0]))) or "-"
         print(f"CITY {ok_n} {tot_n} {asns} {city}")
+    # Мобильная строка - всегда, когда мобильный зонд вообще ответил: отчёту
+    # нужно знать и "доступен", а не только промахи.
+    if mob_stat[1]:
+        asns = ",".join(str(a) for a in sorted(mob_asn_fail)) or "-"
+        print(f"MOBILE {mob_stat[0]} {mob_stat[1]} {asns}")
 
 
 def main():
