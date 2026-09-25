@@ -875,11 +875,8 @@ _skynet_censorcheck_run_and_report() {
 
     report+=$'\n'"<blockquote>${summary_block}</blockquote>"$'\n'
 
-    # Не сворачиваемый список: это призыв к действию, а не справка - должен
-    # быть виден сразу, без разворачивания блока (в отличие от "по городам"
-    # ниже, откуда эти же серверы и посчитаны).
     if [[ -n "$replace_list" ]]; then
-        report+=$'\n'"🔴 <b>Под замену (${replace_n}):</b>"$'\n'"${replace_list}"
+        report+=$'\n'"<blockquote expandable>🔴 <b>Под замену (${replace_n}):</b>"$'\n'"${replace_list}</blockquote>"$'\n'
     fi
 
     if [[ -n "$ok_list" ]]; then
