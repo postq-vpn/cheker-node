@@ -182,6 +182,13 @@ _skynet_censorcheck_tg_send_chunk() {
 # Отправляет произвольно длинный текст, разбивая его на несколько
 # сообщений по границам строк, если он не влезает в лимит Telegram.
 # Возвращает 0, если ВСЕ куски доставлены успешно.
+#
+# Резать разрешено только СНАРУЖИ <blockquote>: разрез посреди открытого
+# тега отправляет Telegram половину пары ("Can't find end tag..." /
+# "Unexpected end tag...") и валит ВЕСЬ кусок, а не только форматирование.
+# Поэтому пока открыт хотя бы один blockquote, чанк копится дальше,
+# даже за счёт max_len - overshoot на один блок безопаснее гарантированно
+# битого HTML.
 _skynet_censorcheck_tg_send() {
     local full_text="$1"
     local token="${TG_BOT_TOKEN:-}"
@@ -193,14 +200,19 @@ _skynet_censorcheck_tg_send() {
 
     local max_len=3500
     local chunk="" all_ok=0 http_code
+    local depth=0 line
 
     while IFS= read -r line; do
-        if (( ${#chunk} + ${#line} + 1 > max_len )) && [[ -n "$chunk" ]]; then
+        if (( depth == 0 )) && (( ${#chunk} + ${#line} + 1 > max_len )) && [[ -n "$chunk" ]]; then
             http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
             [[ "$http_code" != "200" ]] && all_ok=1
             chunk=""
         fi
         chunk+="${line}"$'\n'
+
+        case "$line" in *'</blockquote>'*) depth=$((depth - 1)) ;; esac
+        case "$line" in *'<blockquote'*) depth=$((depth + 1)) ;; esac
+        (( depth < 0 )) && depth=0
     done <<< "$full_text"
 
     if [[ -n "$chunk" ]]; then
