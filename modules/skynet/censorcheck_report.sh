@@ -204,6 +204,7 @@ _skynet_censorcheck_tg_send() {
 
     while IFS= read -r line; do
         if (( depth == 0 )) && (( ${#chunk} + ${#line} + 1 > max_len )) && [[ -n "$chunk" ]]; then
+            log "CensorCheck: DEBUG отправляю чанк len=${#chunk} preview=[$(printf '%s' "$chunk" | head -c 60 | tr '\n' '|')]"
             http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
             [[ "$http_code" != "200" ]] && all_ok=1
             chunk=""
@@ -216,6 +217,7 @@ _skynet_censorcheck_tg_send() {
     done <<< "$full_text"
 
     if [[ -n "$chunk" ]]; then
+        log "CensorCheck: DEBUG отправляю финальный чанк len=${#chunk} preview=[$(printf '%s' "$chunk" | head -c 60 | tr '\n' '|')]"
         http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
         [[ "$http_code" != "200" ]] && all_ok=1
     fi
