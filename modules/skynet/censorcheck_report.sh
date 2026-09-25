@@ -158,12 +158,25 @@ _skynet_censorcheck_tg_send_chunk() {
     local -a topic_args=()
     [[ -n "$topic_id" ]] && topic_args=(--data-urlencode "message_thread_id=${topic_id}")
 
-    curl -s -m 20 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+    # Тело ответа держим отдельно от кода: при ошибке Telegram присылает
+    # причину текстом ("can't parse entities: ..." и т.п.) - без неё
+    # ОШИБКА в логе означает только "не удалось", без единой зацепки, что
+    # чинить.
+    local body_file; body_file=$(mktemp)
+    local http_code
+    http_code=$(curl -s -m 20 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         ${topic_args[@]+"${topic_args[@]}"} \
         --data-urlencode "text=${text}" \
         --data-urlencode "parse_mode=HTML" \
-        -o /dev/null -w '%{http_code}'
+        -o "$body_file" -w '%{http_code}')
+
+    if [[ "$http_code" != "200" ]]; then
+        log "CensorCheck: Telegram ответил ${http_code}: $(tr -d '\n' < "$body_file" | cut -c1-500)"
+    fi
+    rm -f "$body_file"
+
+    printf '%s' "$http_code"
 }
 
 # Отправляет произвольно длинный текст, разбивая его на несколько
@@ -627,6 +640,13 @@ _skynet_censorcheck_run_and_report() {
     # ("Нижний Новгород") ассоциативному массиву не мешает.
     local -A city_servers=() city_asns=()
 
+    # Сервер попадает "под замену", когда режется не в одном городе, а
+    # системно: заблокирован минимум в TSPU_REPLACE_CITY_SHARE% городов
+    # выборки, и средняя доступность по этим городам ниже TSPU_REPLACE_AVG_THRESHOLD%.
+    # Один заблокированный город (даже 0%) сам по себе повода не даёт - это
+    # может быть локальная особенность конкретной сети, а не сервер целиком.
+    local replace_list="" replace_n=0
+
     # Зонды всего флота в одной куче: доступность по флоту это доля дошедших
     # зондов, а не среднее из процентов серверов - у тех разные знаменатели.
     local fleet_ok=0 fleet_total=0
@@ -698,6 +718,7 @@ _skynet_censorcheck_run_and_report() {
         # выше в своей секции.
         local short_name; short_name=$(_skynet_censorcheck_html_escape "${name%% (*}")
         local _c miss pct asns city
+        local server_city_hits=0 server_pct_sum=0
         while read -r _c miss pct asns city; do
             [[ -n "$city" ]] || continue
             # Каждый сервер - отдельной строкой (не через запятую): в городах
@@ -705,7 +726,21 @@ _skynet_censorcheck_run_and_report() {
             # в нечитаемый абзац.
             city_servers["$city"]+="${short_name} (${pct}%)"$'\n'
             [[ "$asns" != "-" ]] && city_asns["$city"]+="${asns},"
+            server_city_hits=$((server_city_hits + 1))
+            server_pct_sum=$((server_pct_sum + pct))
         done < <(grep '^CITY ' "${tmp_dir}/${idx}.result" 2>/dev/null)
+
+        # "Под замену": режется системно, не в одном случайном городе -
+        # доля городов с подтверждённым промахом и средняя доступность по
+        # ним обе должны перевалить за порог.
+        if [[ "$city_n" -gt 0 && "$server_city_hits" -gt 0 ]] \
+            && (( server_city_hits * 100 >= city_n * ${TSPU_REPLACE_CITY_SHARE:-50} )); then
+            local server_avg_pct=$(( server_pct_sum / server_city_hits ))
+            if (( server_avg_pct < ${TSPU_REPLACE_AVG_THRESHOLD:-55} )); then
+                replace_list+="• ${short_name} — сред. доступность <b>${server_avg_pct}%</b>, блокировка в ${server_city_hits} из ${city_n} городов"$'\n'
+                replace_n=$((replace_n + 1))
+            fi
+        fi
     done
 
     _skynet_tspu_infra_save_state "$infra_state_lines" "$infra_ok_n" "$infra_blocked_n" "$infra_skip_n"
@@ -827,6 +862,13 @@ _skynet_censorcheck_run_and_report() {
     summary_block="${summary_block%$'\n'}"
 
     report+=$'\n'"<blockquote>${summary_block}</blockquote>"$'\n'
+
+    # Не сворачиваемый список: это призыв к действию, а не справка - должен
+    # быть виден сразу, без разворачивания блока (в отличие от "по городам"
+    # ниже, откуда эти же серверы и посчитаны).
+    if [[ -n "$replace_list" ]]; then
+        report+=$'\n'"🔴 <b>Под замену (${replace_n}):</b>"$'\n'"${replace_list}"
+    fi
 
     if [[ -n "$ok_list" ]]; then
         report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Доступно (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
