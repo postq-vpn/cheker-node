@@ -409,47 +409,22 @@ _skynet_tspu_py() {
     TSPU_MOBILE_PROBES="${TSPU_MOBILE_PROBES:-1}" \
     TSPU_CONTROL_IP="${TSPU_CONTROL_IP:-}" \
     TSPU_CONTROL_SNI="${TSPU_CONTROL_SNI:-}" \
+    TSPU_PARALLEL="${TSPU_PARALLEL:-10}" \
     python3 "$_TSPU_PROBE_SCRIPT" "$@"
 }
 
-# Замер по одному IP. Печатает МНОГОСТРОЧНЫЙ блок:
+# Сырой ответ tspu_probe.py fleet по одному серверу, <tmp_dir>/<idx>.out:
 #   OK <percent> <success> <total> <fault> <dead> <noise>
 #   ASN <asn> <сколько зондов подтверждённо не дошло>   (0..N строк)
 #   CITY <успешно> <всего> <asn,asn|-> <город>          (0..N строк)
 #   MOBILE <успешно> <всего> <asn,asn|->                (0..1 строка)
 # либо одну строку:
-#   SKIP <причина>
+#   NOPORT                                              - 443 не отвечает
+#   ERROR <причина>                                     - RIPE Atlas не ответил
 #
-# Перепроверка промахов живёт внутри tspu_probe.py: полный замер делается
-# один раз, а повтор и контроль идут только по тем зондам, которые
-# промахнулись. Поэтому здесь никаких раундов больше нет.
-_skynet_tspu_probe_once() {
-    local ip="$1" sni="$2" api_key="$3"
-
-    # Без реально слушающего 443 RIPE Atlas всё равно покажет "заблокировано"
-    # для всех зондов - но это не ТСПУ, а просто отсутствие VPN на сервере.
-    # Такие случаи не считаем ни OK, ни BLOCKED - помечаем на ручную проверку.
-    if ! timeout 4 bash -c "echo > /dev/tcp/${ip}/443" 2>/dev/null; then
-        echo "SKIP порт 443 не отвечает (нет VPN/Reality на сервере или сервер недоступен)"
-        return
-    fi
-
-    local py_out
-    py_out=$(_skynet_tspu_py check "$api_key" "$ip" "$sni" 2>/dev/null)
-
-    if [[ -z "$py_out" ]] || [[ "$py_out" == ERROR* ]]; then
-        local reason; reason=$(echo "$py_out" | grep "^ERROR" | head -1)
-        echo "SKIP RIPE Atlas не ответил (${reason:-нет ответа})"
-        return
-    fi
-
-    if [[ "$py_out" != OK\ * ]]; then
-        echo "SKIP не удалось разобрать ответ RIPE Atlas"
-        return
-    fi
-
-    echo "$py_out"
-}
+# Весь флот меряется ОДНИМ процессом питона (см. check_fleet): там же
+# предел параллельности, общий контрольный замер и перепроверка промахов.
+# Здесь только раскладываем ответ по серверам.
 
 # Сохраняет вердикт последней проверки ТСПУ по инфра-серверам в файл
 # состояния - читает его виджет дашборда (05_infra_tspu.sh), сам он новых
@@ -479,7 +454,7 @@ _skynet_tspu_infra_save_state() {
 }
 
 # Итог по одному серверу. Читает <tmp_dir>/<idx>.out, оставленный
-# _skynet_tspu_probe_once, и печатает:
+# tspu_probe.py fleet, и печатает:
 #   AVAILABLE|BLOCKED|SKIP <детали>              - ровно одна первая строка
 #   STAT <успешно> <всего>                        - для сводки по флоту
 #   CITY <промахов> <процент> <asn,asn|-> <город> - 0..N, только проблемные
@@ -496,10 +471,23 @@ _skynet_tspu_summarize_server() {
     [[ -s "$file" ]] || { echo "SKIP замер не выполнялся"; return; }
 
     local head_line; head_line=$(head -1 "$file")
-    if [[ "${head_line%% *}" != "OK" ]]; then
-        echo "${head_line}"
-        return
-    fi
+    case "$head_line" in
+        OK\ *) ;;
+        NOPORT)
+            # Без реально слушающего 443 RIPE Atlas показал бы "заблокировано"
+            # для всех зондов - но это не ТСПУ, а отсутствие VPN на сервере.
+            echo "SKIP порт 443 не отвечает (нет VPN/Reality на сервере или сервер недоступен)"
+            return
+            ;;
+        ERROR*)
+            echo "SKIP RIPE Atlas не ответил (${head_line})"
+            return
+            ;;
+        *)
+            echo "SKIP не удалось разобрать ответ RIPE Atlas"
+            return
+            ;;
+    esac
 
     local _tag percent success total fault dead noise
     read -r _tag percent success total fault dead noise <<< "$head_line"
@@ -567,12 +555,14 @@ _skynet_tspu_summarize_server() {
 #   <tmp_dir>/N.out     - сырой выхлоп замера сервера N
 #   <tmp_dir>/N.result  - вердикт + строки CITY (см. _skynet_tspu_summarize_server)
 #   <tmp_dir>/.count    - количество проверенных серверов N
+#   <tmp_dir>/.targets  - "N<TAB>IP" для tspu_probe.py fleet
 #   <tmp_dir>/.excluded - имена серверов, пропущенных по TSPU_EXCLUDED_SERVERS
 #                         (по одному в строке), файла нет, если таких нет
 #
-# Серверы идут ПАРАЛЛЕЛЬНО, по одному замеру на сервер: перепроверка промахов
-# спрятана внутрь tspu_probe.py и тратит замеры только на те зонды, которым
-# есть что подтверждать.
+# Весь флот - один процесс питона: не больше TSPU_PARALLEL замеров сразу,
+# один контрольный замер на прогон, перепроверка только промахнувшихся
+# зондов. Раньше здесь был питон на каждый сервер одновременно - ~25 МБ
+# памяти на сервер и контроль, повторённый N раз.
 _skynet_tspu_check_fleet_parallel() {
     local sni="$1" api_key="$2"
     local tmp_dir; tmp_dir=$(mktemp -d)
@@ -585,7 +575,6 @@ _skynet_tspu_check_fleet_parallel() {
         [[ -n "$line" ]] && lines+=("$line")
     done < "$FLEET_DATABASE_FILE"
 
-    local -a pids=()
     local i=0 name user ip port key_path sudo_pass category
     for line in "${lines[@]}"; do
         IFS='|' read -r name user ip port key_path sudo_pass category <<< "$line"
@@ -605,12 +594,11 @@ _skynet_tspu_check_fleet_parallel() {
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
         echo "$category" > "${tmp_dir}/${i}.category"
-        ( _skynet_tspu_probe_once "$ip" "$sni" "$api_key" > "${tmp_dir}/${i}.out" ) &
-        pids+=("$!")
+        printf '%s\t%s\n' "$i" "$ip" >> "${tmp_dir}/.targets"
     done
 
-    if [[ ${#pids[@]} -gt 0 ]]; then
-        wait "${pids[@]}" 2>/dev/null
+    if [[ -s "${tmp_dir}/.targets" ]]; then
+        _skynet_tspu_py fleet "$api_key" "$sni" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
     fi
 
     echo "$i" > "${tmp_dir}/.count"
@@ -1317,8 +1305,8 @@ _skynet_censorcheck_probe_set_menu() {
 
         # Прикидка по кредитам считается по чистому прогону, без блокировок:
         # перепроверка тратится только на промахнувшиеся зонды, и на спокойном
-        # флоте её просто нет. При реальной блокировке добавится по два
-        # маленьких замера на каждый промахнувшийся зонд.
+        # флоте её просто нет. При реальной блокировке добавится повтор по
+        # промахнувшимся зондам каждого сервера и один общий контроль.
         local fleet_n=0
         [[ -s "$FLEET_DATABASE_FILE" ]] && fleet_n=$(grep -c . "$FLEET_DATABASE_FILE")
         local excluded_n; excluded_n=$(_skynet_tspu_excluded_count)

@@ -20,16 +20,19 @@
 #      замерах всех серверов за прогон. Иначе проценты между серверами и
 #      прогонами несравнимы.
 #   3. Зонд, у которого сломалась своя сеть, не считается блокировкой -
-#      см. classify() и перепроверку промахов в cmd_check().
+#      см. classify() и перепроверку промахов в check_fleet().
 #
 # Режимы:
 #   tspu_probe.py probes   <api_key> [--refresh]        - состав выборки
 #   tspu_probe.py asnnames                              - ASN -> имя оператора
+#   tspu_probe.py fleet    <api_key> <sni> <targets> <out_dir>
+#                                                       - замер всего флота
 #   tspu_probe.py check    <api_key> <ip> <sni>         - замер по одному IP
 
 import json
 import math
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -65,6 +68,20 @@ if _CTL_IP and _CTL_SNI:
 # способом: домашний каталог того, кто запускает reshala.
 CACHE_FILE = os.path.expanduser("~/.reshala_tspu_probes.json")
 CACHE_TTL_H = float(os.environ.get("TSPU_PROBE_CACHE_TTL_H", "24"))
+
+# Сколько серверов флота меряем одновременно. Весь флот идёт одним процессом
+# (потоки, а не по питону на сервер), так что предел держит не память, а
+# число одновременных замеров на ключ RIPE Atlas.
+PARALLEL = max(1, int(os.environ.get("TSPU_PARALLEL", "10") or 10))
+
+# Ожидание ответов одного замера. Пока зонды отвечают, опрашиваем лёгкий
+# статус замера (сколько назначено и сколько уже ответило), а результаты -
+# с цепочками сертификатов, килобайты на зонд - качаем один раз в конце.
+# Ждать ответа от всех ЗАПРОШЕННЫХ нельзя: зонд, отвалившийся за сутки
+# жизни кэша, RIPE не назначает, и замер всегда тянулся бы до таймаута.
+MEASURE_WAIT_S = 60
+POLL_S = 3
+DEAD_STATUSES = {"No suitable probes", "Failed"}
 
 # Как набирать выборку:
 #   geo    - по городам: видно, ГДЕ режут, но зондов больше и прогон дороже.
@@ -604,16 +621,34 @@ def measure(api_key, target_ip, sni, probe_ids):
     except Exception as e:
         raise RuntimeError(f"API_FAIL:{type(e).__name__}")
 
-    results_url = f"{API}/measurements/{msm_id}/results/"
-    results = []
-    for _ in range(30):
-        time.sleep(2)
+    deadline = time.time() + MEASURE_WAIT_S
+    expected = 0
+    while time.time() < deadline:
+        time.sleep(POLL_S)
         try:
-            results = _get(results_url)
-            if len(results) >= len(probe_ids):
-                break
+            m = _get(f"{API}/measurements/{msm_id}/"
+                     f"?fields=status,probes_scheduled,participant_count")
+        except Exception:
+            continue
+        if (m.get("status") or {}).get("name") in DEAD_STATUSES:
+            raise RuntimeError("NO_DATA")
+        scheduled = m.get("probes_scheduled") or 0
+        expected = m.get("participant_count") or 0
+        if scheduled and expected >= scheduled:
+            break
+
+    # Счётчик участников обновляется чуть раньше, чем результат виден в
+    # выдаче - поэтому пара добирающих запросов, если пришло меньше.
+    results = []
+    for attempt in range(3):
+        try:
+            results = _get(f"{API}/measurements/{msm_id}/results/")
         except Exception:
             pass
+        if results and len(results) >= expected:
+            break
+        if attempt < 2:
+            time.sleep(POLL_S)
 
     if not results:
         raise RuntimeError("NO_DATA")
@@ -692,72 +727,33 @@ def _ok_ids(results):
             if r.get("prb_id") and classify(r) == "ok"}
 
 
-def cmd_check(api_key, ip, sni):
-    """Замер по одному IP с перепроверкой ТОЛЬКО промахнувшихся зондов.
+def summarize(meta, results, again_failed, control_ok):
+    """Строки отчёта по одному серверу из основного замера и перепроверки.
 
-    Полный замер делается один раз. Если промахов нет - на этом всё, второй
-    замер не нужен и не оплачивается. Если промахи есть, по ним - и только по
-    ним - идут два маленьких замера: повтор по тому же серверу и контрольный
-    по заведомо доступной цели.
-
-    Зонд уходит в блокировку, только если промахнулся ОБА раза и при этом
-    доказал, что жив (дотянулся до контроля). Отвалившийся зонд отсеивается
-    сам собой: до контроля он тоже не дотянется, и из расчёта уйдёт целиком -
-    ни в числитель, ни в знаменатель.
+    Зонд уходит в блокировку, только если промахнулся ОБА раза (основной
+    замер и повтор) и при этом доказал, что жив - дотянулся до контроля.
+    Отвалившийся зонд до контроля тоже не дотянется и из расчёта уйдёт
+    целиком - ни в числитель, ни в знаменатель.
     """
-    probes = load_probe_set(api_key)
-    if not probes:
-        print("ERROR NO_PROBES")
-        return
-
-    meta = {p["id"]: p for p in probes}
-    ids = [p["id"] for p in probes]
-
-    try:
-        results = measure(api_key, ip, sni, ids)
-    except RuntimeError as e:
-        print(f"ERROR {e}")
-        return
-
     ok_ids = _ok_ids(results)
     missed = _failed_ids(results)
     fault_n = sum(1 for r in results if classify(r) == "fault")
 
     confirmed, noise, dead = set(), set(), set()
-    if missed:
-        retry_ids = sorted(missed)
-        # Повтор и контроль независимы - гоняем их одновременно, чтобы
-        # прогон не удлинялся на целый замер.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            again = pool.submit(measure, api_key, ip, sni, retry_ids)
-            control = pool.submit(measure_control, api_key, retry_ids)
-            try:
-                again_failed = _failed_ids(again.result())
-            except RuntimeError:
-                again_failed = set(retry_ids)
-            try:
-                control_ok = _ok_ids(control.result())
-            except RuntimeError:
-                # Контроль не удался - подтверждать живость нечем. Считаем
-                # промахи неподтверждёнными, а не блокировкой: ошибиться в
-                # сторону "доступно" здесь безопаснее.
-                control_ok = set()
-
-        for pid in missed:
-            if pid not in control_ok:
-                dead.add(pid)
-            elif pid in again_failed:
-                confirmed.add(pid)
-            else:
-                noise.add(pid)
+    for pid in missed:
+        if pid not in control_ok:
+            dead.add(pid)
+        elif pid in again_failed:
+            confirmed.add(pid)
+        else:
+            noise.add(pid)
 
     # Молчуны (зонд не вернул результата вовсе) и fault в знаменатель не
     # идут: они ничего не говорят ни за блокировку, ни против неё.
     counted = ok_ids | confirmed | noise
     total = len(counted)
     if total == 0:
-        print(f"ERROR NO_USABLE_RESULTS:{fault_n}")
-        return
+        return [f"ERROR NO_USABLE_RESULTS:{fault_n}"]
 
     success = len(ok_ids) + len(noise)
     asn_fail = {}
@@ -794,10 +790,10 @@ def cmd_check(api_key, ip, sni):
             per_city = city_asn_fail.setdefault(city, {})
             per_city[asn] = per_city.get(asn, 0) + 1
 
-    print(f"OK {success * 100 // total} {success} {total} "
-          f"{fault_n} {len(dead)} {len(noise)}")
+    lines = [f"OK {success * 100 // total} {success} {total} "
+             f"{fault_n} {len(dead)} {len(noise)}"]
     for asn, count in sorted(asn_fail.items(), key=lambda kv: (-kv[1], kv[0])):
-        print(f"ASN {asn} {count}")
+        lines.append(f"ASN {asn} {count}")
     # Имя города идёт последним полем: в нём бывает пробел ("Нижний
     # Новгород"), и в bash оно должно попасть в остаток строки целиком.
     for city, (ok_n, tot_n) in sorted(city_stat.items()):
@@ -806,12 +802,120 @@ def cmd_check(api_key, ip, sni):
         failed = city_asn_fail.get(city, {})
         asns = ",".join(str(a) for a, _ in
                         sorted(failed.items(), key=lambda kv: (-kv[1], kv[0]))) or "-"
-        print(f"CITY {ok_n} {tot_n} {asns} {city}")
+        lines.append(f"CITY {ok_n} {tot_n} {asns} {city}")
     # Мобильная строка - всегда, когда мобильный зонд вообще ответил: отчёту
     # нужно знать и "доступен", а не только промахи.
     if mob_stat[1]:
         asns = ",".join(str(a) for a in sorted(mob_asn_fail)) or "-"
-        print(f"MOBILE {mob_stat[0]} {mob_stat[1]} {asns}")
+        lines.append(f"MOBILE {mob_stat[0]} {mob_stat[1]} {asns}")
+    return lines
+
+
+def _port_open(ip, port=443, timeout=4):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def check_fleet(api_key, sni, targets, port_check=True):
+    """Замер всех серверов за один прогон. targets - [(ключ, ip)].
+
+    Возвращает {ключ: [строки отчёта]}. Три фазы:
+      1. Основной замер каждого сервера всеми зондами выборки - не больше
+         PARALLEL замеров одновременно.
+      2. Перепроверка ТОЛЬКО промахнувшихся зондов: повтор по своему серверу
+         и ОДИН общий контрольный замер на весь флот. Живость зонда от
+         сервера не зависит - контроль на каждый сервер тратил бы кредиты
+         N раз и упирался в лимит RIPE (25 одновременных замеров на одну
+         цель), а при массовой блокировке как раз у всех есть промахи.
+      3. Сборка строк по каждому серверу (summarize).
+    """
+    probes = load_probe_set(api_key)
+    if not probes:
+        return {key: ["ERROR NO_PROBES"] for key, _ in targets}
+
+    meta = {p["id"]: p for p in probes}
+    ids = [p["id"] for p in probes]
+    out, results = {}, {}
+
+    def first_pass(key, ip):
+        # Без реально слушающего 443 RIPE Atlas покажет "заблокировано" для
+        # всех зондов - но это не ТСПУ, а отсутствие VPN на сервере. Такой
+        # замер не стоит ни кредитов, ни места в выборке.
+        if port_check and not _port_open(ip):
+            return key, None, "NOPORT"
+        try:
+            return key, measure(api_key, ip, sni, ids), None
+        except RuntimeError as e:
+            return key, None, f"ERROR {e}"
+
+    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+        for key, res, err in pool.map(lambda t: first_pass(*t), targets):
+            if err:
+                out[key] = [err]
+            else:
+                results[key] = res
+
+    missed = {key: _failed_ids(res) for key, res in results.items()}
+    all_missed = sorted(set().union(*missed.values())) if missed else []
+
+    again_failed = {}
+    control_ok = set()
+    if all_missed:
+        ip_of = dict(targets)
+
+        def retry(key):
+            try:
+                return key, _failed_ids(measure(api_key, ip_of[key], sni, sorted(missed[key])))
+            except RuntimeError:
+                return key, set(missed[key])
+
+        with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+            # Контроль - первым в очередь: он один на всех и нужен каждому.
+            control = pool.submit(measure_control, api_key, all_missed)
+            retries = [pool.submit(retry, key) for key in missed if missed[key]]
+            for f in retries:
+                key, failed = f.result()
+                again_failed[key] = failed
+            try:
+                control_ok = _ok_ids(control.result())
+            except RuntimeError:
+                # Контроль не удался - подтверждать живость нечем. Считаем
+                # промахи неподтверждёнными, а не блокировкой: ошибиться в
+                # сторону "доступно" здесь безопаснее.
+                control_ok = set()
+
+    for key, res in results.items():
+        out[key] = summarize(meta, res, again_failed.get(key, set()), control_ok)
+    return out
+
+
+def cmd_check(api_key, ip, sni):
+    """Один сервер - для ручной отладки. Порт не проверяется."""
+    for line in check_fleet(api_key, sni, [("1", ip)], port_check=False)["1"]:
+        print(line)
+
+
+def cmd_fleet(api_key, sni, targets_file, out_dir):
+    """Весь флот: targets_file - строки "<ключ>\\t<ip>", ответ по каждому
+    серверу - в <out_dir>/<ключ>.out (формат как у cmd_check, либо NOPORT)."""
+    targets = []
+    with open(targets_file, encoding="utf-8") as fh:
+        for line in fh:
+            key, _, ip = line.strip().partition("\t")
+            if key and ip:
+                targets.append((key, ip))
+    if not targets:
+        return
+    try:
+        out = check_fleet(api_key, sni, targets)
+    except Exception as e:
+        out = {key: [f"ERROR UNEXPECTED:{type(e).__name__}"] for key, _ in targets}
+    for key, lines in out.items():
+        with open(os.path.join(out_dir, f"{key}.out"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
 
 
 def main():
@@ -827,6 +931,9 @@ def main():
             return
         if mode == "asnnames":
             cmd_asnnames()
+            return
+        if mode == "fleet" and len(args) >= 5:
+            cmd_fleet(args[1], args[2], args[3], args[4])
             return
         if mode == "check" and len(args) >= 4:
             cmd_check(args[1], args[2], args[3])
