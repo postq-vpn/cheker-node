@@ -96,6 +96,19 @@ STRICT_GEO = os.environ.get("TSPU_PROBE_STRICT_GEO", "0") == "1"
 # зонд американского хостера.
 EXCLUDE_TAGS = {"datacentre", "datacenter"}
 
+# Зонды на серверах, которые сидят в абонентской сети оператора и потому
+# проходят фильтр по ASN, но абонентом не являются. Тег datacentre им не
+# поставили, а исключать все программные зонды (system-software) нельзя -
+# так ставят зонд и дома (docker, lxc), и выборка теряет Екатеринбург и Омск.
+# Свои добавляются через TSPU_EXCLUDE_PROBES (ID через запятую).
+EXCLUDE_PROBES = {
+    1001553,  # kolo.server66.ru - Дом.ру Урал (AS5563), Екатеринбург
+    1001488,  # sera.server66.ru - Инсис (AS28890), Екатеринбург
+}
+
+_EXCL = os.environ.get("TSPU_EXCLUDE_PROBES", "")
+EXCLUDE_PROBES |= {int(p) for p in _EXCL.replace(" ", "").split(",") if p.isdigit()}
+
 # (имя, широта, долгота). Список заведомо шире, чем нужно: город попадает в
 # выборку только если в нём реально нашлось >= CITY_MIN_PROBES зондов, так
 # что при изменении популяции зондов список чинить не придётся.
@@ -329,7 +342,7 @@ def _usable_probes(skip_ids=()):
     """Живые зонды, годные для замера: рабочий IPv4, не из стойки и - при
     CONSUMER_ONLY - только в сетях мобильных и домашних операторов."""
     for p in fetch_ru_probes():
-        if p["id"] in skip_ids:
+        if p["id"] in skip_ids or p["id"] in EXCLUDE_PROBES:
             continue
         slugs = {t.get("slug") for t in p.get("tags", [])}
         if "system-ipv4-works" not in slugs:
@@ -426,6 +439,8 @@ def select_mobile_probes():
     """
     chosen = []
     for p in fetch_ru_probes():
+        if p["id"] in EXCLUDE_PROBES:
+            continue
         slugs = {t.get("slug") for t in p.get("tags", [])}
         if "system-ipv4-works" not in slugs or slugs & EXCLUDE_TAGS:
             continue
