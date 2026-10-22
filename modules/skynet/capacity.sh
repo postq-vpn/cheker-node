@@ -81,8 +81,12 @@ _skynet_capacity_run_fleet() {
         status=$(cat "${tmp_dir}/${idx}.status" 2>/dev/null)
         [[ "$verbose" -eq 1 ]] && echo ""
 
+        # Выпавший сервер пишем в лог и в тихом режиме: автозамер идёт в фоне,
+        # и иначе от него остаётся только "14 из 16" без единой зацепки, кто
+        # именно выпал и почему.
         if [[ "$status" != "OK" ]]; then
             [[ "$verbose" -eq 1 ]] && printf "${C_RED}❌ %s — сервер недоступен${C_RESET}\n" "$name"
+            log "Замер флота: ${name} — нет ответа по SSH (сервер недоступен, ключ или sudo не подошли)"
             continue
         fi
 
@@ -96,6 +100,10 @@ _skynet_capacity_run_fleet() {
             [[ "$verbose" -eq 1 ]] && printf "${C_GREEN}✅ %s${C_RESET}\n" "$name"
         else
             [[ "$verbose" -eq 1 ]] && printf "${C_YELLOW}⚠️  %s — измерение не выполнено${C_RESET}\n" "$name"
+            # Причину плагин печатает первой строкой после заголовка "=====".
+            local reason
+            reason=$(grep -v '^=====' "${tmp_dir}/${idx}.out" 2>/dev/null | grep -m1 . | cut -c1-200)
+            log "Замер флота: ${name} — ${reason:-плагин не вернул результат}"
         fi
 
         [[ "$verbose" -eq 1 ]] && grep -v '^CAPACITY_USERS=' "${tmp_dir}/${idx}.out" 2>/dev/null | sed 's/^/   /'
