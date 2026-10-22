@@ -418,6 +418,8 @@ _skynet_tspu_py() {
 #   ASN <asn> <сколько зондов подтверждённо не дошло>   (0..N строк)
 #   CITY <успешно> <всего> <asn,asn|-> <город>          (0..N строк)
 #   MOBILE <успешно> <всего> <asn,asn|->                (0..1 строка)
+#   PROBE<TAB>id<TAB>asn<TAB>город<TAB>ответ<TAB>ответ на повторе
+#                                                       (0..N, только для лога)
 # либо одну строку:
 #   NOPORT                                              - 443 не отвечает
 #   ERROR <причина>                                     - RIPE Atlas не ответил
@@ -712,6 +714,10 @@ _skynet_censorcheck_run_and_report() {
     # без HTML-экранирования и без IP (виджету он не нужен).
     local infra_state_lines=""
 
+    # Серверы, не прошедшие проверку, и что ответили их зонды - для лога.
+    # Строки SERVER/PROBE через таб; пишутся после загрузки имён операторов.
+    local probe_log=""
+
     # Город -> кто в нём недоступен и чьи это сети. Ключ с пробелом внутри
     # ("Нижний Новгород") ассоциативному массиву не мешает.
     local -A city_servers=() city_asns=()
@@ -758,6 +764,10 @@ _skynet_censorcheck_run_and_report() {
                     infra_blocked_n=$((infra_blocked_n + 1))
                     infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> не доступен"$'\n'
                     infra_state_lines+="${infra_bare_name}|BLOCKED"$'\n'
+                    local _st st_ok st_tot
+                    read -r _st st_ok st_tot < <(grep '^STAT ' "${tmp_dir}/${idx}.result" 2>/dev/null)
+                    probe_log+="SERVER"$'\t'"${name}"$'\t'"инфра недоступна (${st_ok:-?}/${st_tot:-?} зондов)"$'\n'
+                    probe_log+="$(grep $'^PROBE\t' "${tmp_dir}/${idx}.out" 2>/dev/null)"$'\n'
                     ;;
                 *)
                     infra_skip_n=$((infra_skip_n + 1))
@@ -779,6 +789,8 @@ _skynet_censorcheck_run_and_report() {
             BLOCKED)
                 blocked_n=$((blocked_n + 1))
                 fail_list+="• ${esc_name} — ${detail}"$'\n'
+                probe_log+="SERVER"$'\t'"${name}"$'\t'"${result#* }"$'\n'
+                probe_log+="$(grep $'^PROBE\t' "${tmp_dir}/${idx}.out" 2>/dev/null)"$'\n'
                 ;;
             *)
                 skip_n=$((skip_n + 1))
@@ -862,6 +874,20 @@ _skynet_censorcheck_run_and_report() {
         [[ -n "$a_num" ]] || continue
         asn_titles[$a_num]="$a_name"
     done < <(_skynet_tspu_py asnnames 2>/dev/null)
+
+    # Почему серверы не прошли проверку - в лог, по зонду на строку: чей он
+    # (оператор, город) и что ответил в основном замере и на повторе.
+    local p_tag p_id p_asn p_city p_first p_again p_where
+    while IFS=$'\t' read -r p_tag p_id p_asn p_city p_first p_again; do
+        case "$p_tag" in
+            SERVER) log "CensorCheck: ${p_id} — ${p_asn}" ;;
+            PROBE)
+                p_where="${_TSPU_ASN_NAMES[$p_asn]:-${asn_titles[$p_asn]:-AS$p_asn}}"
+                [[ "$p_city" != "-" ]] && p_where+=", ${p_city}"
+                log "CensorCheck:   зонд ${p_id} (${p_where}): ${p_first}; повтор: ${p_again}"
+                ;;
+        esac
+    done <<< "$probe_log"
 
     # Подпись мобильной выборки: "СИТС, Москва ×2; Билайн, Новосибирск" -
     # одинаковые зонды схлопываются, порядок - как в выборке.

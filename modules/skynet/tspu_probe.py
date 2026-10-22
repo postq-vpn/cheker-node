@@ -727,13 +727,24 @@ def _ok_ids(results):
             if r.get("prb_id") and classify(r) == "ok"}
 
 
-def summarize(meta, results, again_failed, control_ok):
+def _answer_text(result):
+    """Что ответил зонд - для лога, одной строкой без табов."""
+    if result is None:
+        return "нет ответа"
+    text = result.get("err") or result.get("dnserr") or "пустой ответ"
+    return " ".join(str(text).split())[:120]
+
+
+def summarize(meta, results, again_failed, control_ok, again_results=None):
     """Строки отчёта по одному серверу из основного замера и перепроверки.
 
     Зонд уходит в блокировку, только если промахнулся ОБА раза (основной
     замер и повтор) и при этом доказал, что жив - дотянулся до контроля.
     Отвалившийся зонд до контроля тоже не дотянется и из расчёта уйдёт
     целиком - ни в числитель, ни в знаменатель.
+
+    again_results - сырые ответы повтора (None, если повтор не удался):
+    из них и из основного замера берётся текст ошибки для строк PROBE.
     """
     ok_ids = _ok_ids(results)
     missed = _failed_ids(results)
@@ -808,6 +819,21 @@ def summarize(meta, results, again_failed, control_ok):
     if mob_stat[1]:
         asns = ",".join(str(a) for a in sorted(mob_asn_fail)) or "-"
         lines.append(f"MOBILE {mob_stat[0]} {mob_stat[1]} {asns}")
+    # Подтверждённые промахи по одному на строку, поля через таб (в городе
+    # и в тексте ошибки бывают пробелы): что зонд ответил в основном замере
+    # и на повторе. Нужны только для лога - в отчёт не идут.
+    first_by_id = {r.get("prb_id"): r for r in results}
+    again_by_id = {r.get("prb_id"): r for r in (again_results or [])}
+    # Города по алфавиту, мобильные - после них.
+    for pid in sorted(confirmed, key=lambda p: (not meta.get(p, {}).get("city"),
+                                                meta.get(p, {}).get("city") or "", p)):
+        info = meta.get(pid, {})
+        place = info.get("city") or ("моб. " + (info.get("place") or "?")
+                                     if info.get("mobile") else "-")
+        again = (_answer_text(again_by_id.get(pid)) if again_results is not None
+                 else "повтор не выполнен")
+        lines.append("\t".join(["PROBE", str(pid), str(info.get("asn") or 0), place,
+                                _answer_text(first_by_id.get(pid)), again]))
     return lines
 
 
@@ -861,24 +887,26 @@ def check_fleet(api_key, sni, targets, port_check=True):
     missed = {key: _failed_ids(res) for key, res in results.items()}
     all_missed = sorted(set().union(*missed.values())) if missed else []
 
-    again_failed = {}
+    again_failed, again_results = {}, {}
     control_ok = set()
     if all_missed:
         ip_of = dict(targets)
 
         def retry(key):
             try:
-                return key, _failed_ids(measure(api_key, ip_of[key], sni, sorted(missed[key])))
+                res = measure(api_key, ip_of[key], sni, sorted(missed[key]))
+                return key, _failed_ids(res), res
             except RuntimeError:
-                return key, set(missed[key])
+                return key, set(missed[key]), None
 
         with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
             # Контроль - первым в очередь: он один на всех и нужен каждому.
             control = pool.submit(measure_control, api_key, all_missed)
             retries = [pool.submit(retry, key) for key in missed if missed[key]]
             for f in retries:
-                key, failed = f.result()
+                key, failed, res = f.result()
                 again_failed[key] = failed
+                again_results[key] = res
             try:
                 control_ok = _ok_ids(control.result())
             except RuntimeError:
@@ -888,7 +916,8 @@ def check_fleet(api_key, sni, targets, port_check=True):
                 control_ok = set()
 
     for key, res in results.items():
-        out[key] = summarize(meta, res, again_failed.get(key, set()), control_ok)
+        out[key] = summarize(meta, res, again_failed.get(key, set()), control_ok,
+                             again_results.get(key))
     return out
 
 
