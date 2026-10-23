@@ -1083,6 +1083,153 @@ _skynet_censorcheck_run_and_report() {
 }
 
 # ============================================================ #
+#                 РАЗОВАЯ ПРОВЕРКА АДРЕСА НЕ ИЗ ФЛОТА           #
+# ============================================================ #
+
+# Тот же замер, что у сервера флота (зонды, перепроверка промахов,
+# контроль), но по адресу, которого в базе нет: чужой сервер перед покупкой,
+# сайт, новый VPS до добавления во флот. Результат - только на экран и в
+# лог, в Telegram ничего не уходит и состояние виджета инфры не трогается.
+#
+# Домен резолвится в IPv4 здесь, на контрольном хосте: зонды бьют по IP
+# (af=4), а резолв на стороне зонда ловил бы подмену DNS у оператора вместо
+# блокировки IP. SNI по умолчанию - сам домен: сайт проверяется под своим
+# именем, а не под маской из Reality-конфига.
+_skynet_censorcheck_check_address() {
+    clear
+    menu_header "🔎 Проверка IP"
+    printf_description "Разовый замер зондами RIPE Atlas по IP-адресу или домену,"
+    printf_description "которого нет в базе флота. Результат — только на экран,"
+    printf_description "без отчёта в Telegram."
+    echo ""
+
+    if [[ -z "${RIPE_API_KEY:-}" ]]; then
+        printf_error "Сначала настрой RIPE Atlas ключ [k]."
+        wait_for_enter
+        return
+    fi
+
+    ensure_package "python3" >/dev/null 2>&1 || true
+
+    local target; target=$(ask_non_empty "IP-адрес или домен") || return
+    target="${target// /}"
+    # Вставленная ссылка целиком: схема, путь и порт отрезаются.
+    target="${target#*://}"
+    target="${target%%/*}"
+    target="${target%%:*}"
+
+    local ip="" sni_default="${TSPU_REALITY_SNI:-max.ru}"
+    if [[ "$target" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local octet
+        for octet in "${BASH_REMATCH[@]:1}"; do
+            if (( 10#$octet > 255 )); then
+                printf_error "Некорректный IP-адрес: ${target}"
+                wait_for_enter
+                return
+            fi
+        done
+        ip="$target"
+    elif [[ "$target" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+        ip=$(python3 -c 'import socket, sys; print(socket.gethostbyname(sys.argv[1]))' "$target" 2>/dev/null)
+        if [[ -z "$ip" ]]; then
+            printf_error "Не удалось получить IPv4-адрес домена ${target}."
+            wait_for_enter
+            return
+        fi
+        printf_info "${target} → ${ip}"
+        sni_default="$target"
+    else
+        printf_error "Это не IPv4-адрес и не домен: ${target}"
+        wait_for_enter
+        return
+    fi
+
+    local sni; sni=$(ask_non_empty "SNI для пробы" "$sni_default") || return
+
+    local probes_out; probes_out=$(_skynet_tspu_py probes "$RIPE_API_KEY" 2>/dev/null)
+    if [[ "$probes_out" != OK\ * ]]; then
+        printf_error "Не удалось собрать выборку зондов RIPE Atlas (${probes_out:-нет ответа})."
+        wait_for_enter
+        return
+    fi
+    local _p probe_n city_n
+    read -r _p probe_n city_n <<< "$(echo "$probes_out" | head -1)"
+
+    echo ""
+    printf_description "Цель: ${C_GREEN}${ip}${C_RESET}, SNI ${C_GREEN}${sni}${C_RESET}"
+    printf_description "Зондов: ${probe_n}, цена замера: ${C_YELLOW}$(( probe_n * _CENSORCHECK_CREDITS_PER_PROBE ))${C_RESET} кредитов RIPE Atlas"
+    printf_description "  (плюс перепроверка, если будут промахи)"
+    echo ""
+    ask_yes_no "Запустить замер?" "y" || return
+
+    printf_info "Меряю, промахи перепроверяются отдельно — это займёт пару минут."
+
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    printf '1\t%s\n' "$ip" > "${tmp_dir}/.targets"
+    _skynet_tspu_py fleet "$RIPE_API_KEY" "$sni" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
+    _skynet_tspu_summarize_server "$tmp_dir" 1 > "${tmp_dir}/1.result"
+
+    local -A asn_titles=()
+    local a_num a_name
+    while IFS=$'\t' read -r a_num a_name; do
+        [[ -n "$a_num" ]] || continue
+        asn_titles[$a_num]="$a_name"
+    done < <(_skynet_tspu_py asnnames 2>/dev/null)
+
+    local result; result=$(head -1 "${tmp_dir}/1.result")
+    local kind="${result%% *}" detail="${result#* }"
+    [[ "$detail" == "$result" ]] && detail=""
+
+    echo ""
+    case "$kind" in
+        AVAILABLE) printf_ok "${target}: доступен из сетей РФ${detail:+ (${detail})}" ;;
+        BLOCKED)   printf_warning "${target}: блокировка — ${detail}" ;;
+        *)         printf_warning "${target}: не удалось померить — ${detail}" ;;
+    esac
+    log "CensorCheck: ручная проверка ${target} (${ip}, SNI ${sni}) — ${result}"
+
+    # Города и мобильная сеть - в том же виде, что раздел географии отчёта,
+    # но операторы прямо в строке: сервер здесь один.
+    local _c miss pct asns city ops op
+    while read -r _c miss pct asns city; do
+        [[ -n "$city" ]] || continue
+        ops=""
+        for a_num in $(printf '%s' "$asns" | tr ',' '\n' | sort -un); do
+            [[ "$a_num" =~ ^[0-9]+$ ]] || continue
+            op="${_TSPU_ASN_NAMES[$a_num]:-${asn_titles[$a_num]:-AS$a_num}}"
+            [[ ", ${ops}" == *", ${op}, "* ]] && continue
+            ops+="${op}, "
+        done
+        ops="${ops%, }"
+        printf_description "  • ${city} — доступно ${pct}%${ops:+, режет: ${ops}}"
+    done < <(grep '^CITY ' "${tmp_dir}/1.result")
+
+    local _m m_miss m_pct m_asns
+    read -r _m m_miss m_pct m_asns < <(grep '^MOBILE ' "${tmp_dir}/1.result")
+    if [[ -n "${m_miss:-}" ]]; then
+        if [[ "$m_miss" -eq 0 ]]; then
+            printf_description "  • 📱 Мобильная сеть — доступен"
+        else
+            printf_description "  • 📱 Мобильная сеть — доступно ${m_pct}%"
+        fi
+    fi
+
+    # Что ответили зонды с подтверждённым промахом - на экран и в лог.
+    local p_tag p_id p_asn p_city p_first p_again p_where
+    while IFS=$'\t' read -r p_tag p_id p_asn p_city p_first p_again; do
+        [[ "$p_tag" == PROBE ]] || continue
+        p_where="${_TSPU_ASN_NAMES[$p_asn]:-${asn_titles[$p_asn]:-AS$p_asn}}"
+        [[ "$p_city" != "-" ]] && p_where+=", ${p_city}"
+        printf_description "    зонд ${p_id} (${p_where}): ${p_first}; повтор: ${p_again}"
+        log "CensorCheck:   зонд ${p_id} (${p_where}): ${p_first}; повтор: ${p_again}"
+    done < "${tmp_dir}/1.out"
+
+    rm -rf "$tmp_dir"
+    echo ""
+    wait_for_enter
+}
+
+# ============================================================ #
 #                       ПЛАНИРОВЩИК (CRON)                     #
 # ============================================================ #
 
@@ -1553,6 +1700,7 @@ _skynet_censorcheck_menu() {
         printf_menu_option "s" "Серверы в проверке (включить/исключить)"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
         printf_menu_option "r" "Запустить проверку и отчёт СЕЙЧАС"
+        printf_menu_option "i" "Проверка IP"
         echo ""
         printf_menu_option "b" "Назад"
         echo ""
@@ -1564,6 +1712,7 @@ _skynet_censorcheck_menu() {
             [gG]) _skynet_censorcheck_probe_set_menu ;;
             [sS]) _skynet_censorcheck_servers_menu ;;
             [eE]) _skynet_censorcheck_schedule_menu ;;
+            [iI]) _skynet_censorcheck_check_address ;;
             [rR])
                 if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]]; then
                     printf_error "Сначала настрой Telegram [n]."
