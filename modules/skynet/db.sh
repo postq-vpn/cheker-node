@@ -52,45 +52,9 @@ _skynet_category_label() {
 
 _sanitize_fleet_database() {
     if [ -f "$FLEET_DATABASE_FILE" ]; then
-        local original_file="$FLEET_DATABASE_FILE"
-        local temp_file=$(mktemp)
-        local modified_count=0
-
-        # Read original file line by line
-        while IFS='|' read -r name user ip port key_path sudo_pass category; do
-            local current_line="$name|$user|$ip|$port|$key_path|$sudo_pass|$category"
-            local new_key_path="$key_path"
-
-            # Check if it's an old-style unique key and needs migration
-            # Condition: starts with SKYNET_UNIQUE_KEY_PREFIX, has an IP, and doesn't have an IP part in the filename yet
-            if [[ "$key_path" == "${HOME}/.ssh/${SKYNET_UNIQUE_KEY_PREFIX}"* ]] && [[ -n "$ip" ]]; then
-                # Extract the old key_name part from the path
-                local old_key_filename=$(basename "$key_path")
-                local safe_name_part=$(echo "$name" | tr -cd '[:alnum:]_-')
-                local safe_ip_part=$(echo "$ip" | tr '.' '_')
-                local expected_new_filename="${SKYNET_UNIQUE_KEY_PREFIX}${safe_name_part}_${safe_ip_part}"
-
-                # Compare current filename with the expected new filename
-                # If they are different, it's an old-style key that needs updating
-                if [[ "$old_key_filename" != "$expected_new_filename" ]]; then
-                    # Generate the new key path using the new convention
-                    # _generate_unique_key is expected to return the new path
-                    new_key_path=$(_generate_unique_key "$name" "$ip") >/dev/null # Suppress stdout
-                    modified_count=$((modified_count + 1))
-                    printf_info "Migrated key path for '${name}' (old: ${key_path}, new: ${new_key_path})" >&2
-                    current_line="$name|$user|$ip|$port|$new_key_path|$sudo_pass|$category"
-                fi
-            fi
-            echo "$current_line" >> "$temp_file"
-        done < "$original_file"
-
-        # Overwrite the original file only if changes were made
-        if [[ "$modified_count" -gt 0 ]]; then
-            mv "$temp_file" "$original_file"
-            printf_ok "Fleet database migrated: updated $modified_count unique key paths." >&2
-        else
-            rm "$temp_file"
-        fi
+        # Путь к ключу здесь не меняем: файл ключа остаётся со старым именем и
+        # после переименования сервера или смены IP, а новый ключ на сервер не
+        # загружен, и подмена оставила бы Решалу без доступа.
 
         # Original cleanup logic (remove empty lines and invalid entries)
         sed -i '/^$/d' "$FLEET_DATABASE_FILE"
