@@ -46,6 +46,18 @@ ufw --force reset >/dev/null
 ufw default deny incoming >/dev/null
 ufw default allow outgoing >/dev/null
 
+# SSH и VPN - сразу после сброса и до всего остального: даже если дальше что-то
+# пойдёт не так, включённый файрвол не должен закрыть доступ к серверу.
+# Разрешаем SSH для всех (если не в GWL), иначе можно потерять доступ
+# Если GWL был пуст, то это единственный способ зайти.
+ufw allow "$TARGET_SSH_PORT"/tcp comment 'SSH Port' >/dev/null
+ok "Порт SSH ($TARGET_SSH_PORT) открыт."
+
+# Основной порт для VPN (стандарт Reshala)
+ufw allow 443/tcp comment 'VPN/HTTPS' >/dev/null
+ufw allow 443/udp comment 'VPN/UDP' >/dev/null
+ok "Порты 443 TCP/UDP (VPN) открыты."
+
 # --- СИНХРОНИЗАЦИЯ ГЛОБАЛЬНОГО БЕЛОГО СПИСКА ---
 temp_gwl=$(mktemp)
 if [[ -n "${GWL_B64:-}" ]]; then
@@ -61,24 +73,20 @@ if [[ -s "$temp_gwl" ]]; then
     ips=$(grep -v '^\s*#' "$temp_gwl" | grep -v '^\s*$' | awk '{print $1}' | sort -u)
     count=0
     for ip in $ips; do
-        ufw allow from "$ip" comment 'GWL Trusted' >/dev/null
-        ((count++))
+        # Не ((count++)): при count=0 оно возвращает ошибку, и set -e обрывал
+        # плагин после сброса правил, оставляя файрвол выключенным. Плохая
+        # запись в списке тоже не повод бросать настройку на полпути.
+        if ufw allow from "$ip" comment 'GWL Trusted' >/dev/null; then
+            count=$((count + 1))
+        else
+            warn "Пропущена некорректная запись белого списка: $ip"
+        fi
     done
     ok "Добавлено $count уникальных IP из Глобального Белого Списка."
 else
     warn "Глобальный Белый Список пуст. Используются только стандартные правила."
 fi
 rm -f "$temp_gwl"
-
-# Разрешаем SSH для всех (если не в GWL), иначе можно потерять доступ
-# Если GWL был пуст, то это единственный способ зайти.
-ufw allow "$TARGET_SSH_PORT"/tcp comment 'SSH Port' >/dev/null
-ok "Порт SSH ($TARGET_SSH_PORT) открыт."
-
-# Основной порт для VPN (стандарт Reshala)
-ufw allow 443/tcp comment 'VPN/HTTPS' >/dev/null
-ufw allow 443/udp comment 'VPN/UDP' >/dev/null
-ok "Порты 443 TCP/UDP (VPN) открыты."
 
 # --- Docker UFW Fix (Professional) ---
 if command -v docker &>/dev/null; then
@@ -100,14 +108,12 @@ with open(rules_file, 'r') as f:
     content = f.read()
 docker_block = f"""
 {marker_s}
-*filter
 :DOCKER-USER - [0:0]
 -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 -A DOCKER-USER -i {iface} -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
 -A DOCKER-USER -i {iface} -j ufw-user-forward
 -A DOCKER-USER -i {iface} -j DROP
 -A DOCKER-USER -j RETURN
-COMMIT
 {marker_e}
 """
 if 'COMMIT' in content:
@@ -126,8 +132,10 @@ PYEOF
     done
 fi
 
-# Включаем UFW
-echo "y" | ufw enable >/dev/null
+# Включаем UFW и проверяем, что он реально поднялся: правила уже сброшены, и
+# молчаливая неудача оставила бы сервер без файрвола.
+echo "y" | ufw enable >/dev/null || err "UFW не включился: сервер сейчас БЕЗ файрвола."
+LC_ALL=C ufw status | grep -qw "active" || err "UFW не активен: сервер сейчас БЕЗ файрвола."
 ok "UFW активирован и работает (IPv6: ON)."
 
 ok "Настройка файрвола завершена."
