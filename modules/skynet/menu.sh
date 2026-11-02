@@ -632,7 +632,16 @@ _show_server_security_menu() {
         local env; env=$(_sss_get_gwl_env)
         env="${env} OLD_SSH_PORT=$s_port NEW_SSH_PORT=$new_port"
         
-        if _skynet_run_plugin_on_server_with_env "plugins/skynet_commands/security/02_change_ssh_port.sh" "$env" "$s_name" "$s_user" "$s_ip" "$s_port" "$s_key" "$s_pass"; then
+        local rc=0
+        _skynet_run_plugin_on_server_with_env "plugins/skynet_commands/security/02_change_ssh_port.sh" "$env" "$s_name" "$s_user" "$s_ip" "$s_port" "$s_key" "$s_pass" || rc=$?
+        # 255 - ssh потерял связь, а не плагин вернул ошибку: порт мог успеть
+        # смениться. Верим только реальному входу по новому порту.
+        if [[ "$rc" -eq 255 ]] && ssh -n -q -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i "$s_key" -p "$new_port" "${s_user}@${s_ip}" exit; then
+            warn "Связь с сервером оборвалась, но вход по новому порту работает."
+            rc=0
+        fi
+
+        if [[ "$rc" -eq 0 ]]; then
             ok "Порт успешно изменен на стороне сервера. Обновляю базу Skynet..."
             s_port=$new_port
             local new_server_data="${s_name}|${s_user}|${s_ip}|${s_port}|${s_key}|${s_pass}|${s_category}"
@@ -695,6 +704,9 @@ _show_server_security_menu() {
             # Выполняем локальную функцию, которая уже знает о сервере
             "$func_name"
             local ret=$?
+            if [[ $ret -ne 0 && $ret -ne 2 ]]; then
+                err "Команда на сервере завершилась с ошибкой (код ${ret})."
+            fi
             [[ $ret -ne 2 ]] && wait_for_enter
         else
             warn "Неверный выбор"

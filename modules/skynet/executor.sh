@@ -38,7 +38,9 @@ _skynet_run_plugin_on_server() {
         fi
     fi
 
-    local run_cmd="bash /tmp/reshala_plugin.sh; rm -f /tmp/reshala_plugin.sh"
+    # Код выхода плагина сохраняем: иначе наружу уйдёт код rm, то есть всегда 0,
+    # и вызывающий код посчитает упавший плагин успешным.
+    local run_cmd="bash /tmp/reshala_plugin.sh; rc=\$?; rm -f /tmp/reshala_plugin.sh; exit \$rc"
 
     # Если пользователь не root и есть пароль, используем sudo.
     # Пароль передаётся через stdin ssh-канала, а не вклеивается в текст
@@ -79,7 +81,7 @@ _skynet_run_plugin_on_server_with_env() {
     fi
 
     # env_vars – это строка наподобие "VAR1=val1 VAR2=val2"
-    local run_cmd="${env_vars} bash /tmp/reshala_plugin.sh; rm -f /tmp/reshala_plugin.sh"
+    local run_cmd="${env_vars} bash /tmp/reshala_plugin.sh; rc=\$?; rm -f /tmp/reshala_plugin.sh; exit \$rc"
 
     # См. комментарии в _skynet_run_plugin_on_server: пароль идёт через stdin
     # ssh-канала, а явный stdin (</dev/null или heredoc) обязателен на КАЖДОЙ
@@ -114,27 +116,31 @@ _skynet_run_plugin_for_capture() {
         return 1
     fi
 
-    local run_cmd="${env_vars} bash ${temp_plugin_path}; rm -f ${temp_plugin_path}"
+    local run_cmd="${env_vars} bash ${temp_plugin_path}; rc=\$?; rm -f ${temp_plugin_path}; exit \$rc"
 
     # Выполняем и захватываем вывод. Без -t для чистого вывода.
     # Пароль (если нужен sudo) - через stdin, см. _skynet_run_plugin_on_server.
-    local output
+    local output rc
     if [[ "$user" != "root" && -n "$sudo_pass" ]]; then
         local quoted_run_cmd; printf -v quoted_run_cmd '%q' "$run_cmd"
         output=$(ssh -p "$port" -F /dev/null -o IdentitiesOnly=yes -i "$key_path" -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${user}@${ip}" "sudo -S -p '' bash -c ${quoted_run_cmd}" <<< "$sudo_pass" 2>/dev/null)
+        rc=$?
     else
         output=$(ssh -p "$port" -F /dev/null -o IdentitiesOnly=yes -i "$key_path" -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${user}@${ip}" "$run_cmd" < /dev/null 2>/dev/null)
+        rc=$?
     fi
 
     echo "$output"
+    return "$rc"
 }
 
 # Запускает плагин на ВСЕХ серверах флота ПАРАЛЛЕЛЬНО (в фоне) и складывает
 # результаты в файлы внутри временной директории, путь к которой печатает
 # в stdout (единственная строка вывода). На каждый обработанный сервер N:
 #   <tmp_dir>/N.name   - "Имя (IP)"
-#   <tmp_dir>/N.status - "OK" | "FAIL"
-#   <tmp_dir>/N.out    - захваченный вывод плагина (только если OK)
+#   <tmp_dir>/N.status - "OK" | "ERROR" (плагин завершился с ошибкой) |
+#                        "FAIL" (ошибка и пустой вывод: сервер недоступен)
+#   <tmp_dir>/N.out    - захваченный вывод плагина (если он есть)
 # <tmp_dir>/.count     - общее количество серверов N
 # Вызывающая сторона сама решает, как показать результаты, и должна
 # удалить tmp_dir после использования.
@@ -169,13 +175,16 @@ _skynet_run_plugin_on_fleet_parallel_capture() {
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
         (
-            local out
+            local out rc
             out=$(_skynet_run_plugin_for_capture "$plugin" "$env_vars" "$name" "$user" "$ip" "$port" "$key_path" "$sudo_pass")
-            if [[ -z "$out" ]]; then
-                echo "FAIL" > "${tmp_dir}/${i}.status"
-            else
-                printf '%s' "$out" > "${tmp_dir}/${i}.out"
+            rc=$?
+            [[ -n "$out" ]] && printf '%s' "$out" > "${tmp_dir}/${i}.out"
+            if [[ "$rc" -eq 0 ]]; then
                 echo "OK" > "${tmp_dir}/${i}.status"
+            elif [[ -n "$out" ]]; then
+                echo "ERROR" > "${tmp_dir}/${i}.status"
+            else
+                echo "FAIL" > "${tmp_dir}/${i}.status"
             fi
         ) &
         pids+=("$!")
@@ -217,6 +226,9 @@ _skynet_run_plugin_on_fleet_parallel() {
         echo ""
         if [[ "$status" == "OK" ]]; then
             printf "${C_GREEN}✅ %s${C_RESET}\n" "$name"
+            sed 's/^/   /' "${tmp_dir}/${idx}.out" 2>/dev/null
+        elif [[ "$status" == "ERROR" ]]; then
+            printf "${C_RED}❌ %s — команда завершилась с ошибкой${C_RESET}\n" "$name"
             sed 's/^/   /' "${tmp_dir}/${idx}.out" 2>/dev/null
         else
             printf "${C_RED}❌ %s — сервер недоступен${C_RESET}\n" "$name"
@@ -369,8 +381,12 @@ _run_fleet_command() {
                 IFS='|' read -r name user ip port key_path sudo_pass category <<< "${servers[$s_choice]}"
                 printf_warning "Команда '${selected_plugin##*/}' будет выполнена на сервере '$name'."
                 if ask_yes_no "Начать? (y/n): " "n"; then
-                    _skynet_run_plugin_on_server "$selected_plugin" "$name" "$user" "$ip" "$port" "$key_path" "$sudo_pass"
-                    printf_ok "Команда выполнена."; wait_for_enter
+                    if _skynet_run_plugin_on_server "$selected_plugin" "$name" "$user" "$ip" "$port" "$key_path" "$sudo_pass"; then
+                        printf_ok "Команда выполнена."
+                    else
+                        printf_error "Команда завершилась с ошибкой."
+                    fi
+                    wait_for_enter
                 fi
             fi
         else
