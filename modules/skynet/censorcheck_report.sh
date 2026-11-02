@@ -422,7 +422,12 @@ _skynet_tspu_py() {
 #                                                       (0..N, только для лога)
 # либо одну строку:
 #   NOPORT                                              - 443 не отвечает
-#   ERROR <причина>                                     - RIPE Atlas не ответил
+#   ERROR <причина>                                     - сервер не проверен:
+#     NO_DATA:msm=<номер>                 результатов нет за время ожидания
+#     API_POLL:<ошибка>:msm=<номер>       не удалось получить результаты у API
+#     MSM_DEAD:<статус>:msm=<номер>       RIPE объявил замер несостоявшимся
+#     CONTROL_FAILED:<промахов>/<всего>:<причина>  контроль не удался
+#     RETRY_FAILED:<промахов>/<всего>:<причина>    перепроверка не удалась
 #
 # Весь флот меряется ОДНИМ процессом питона (см. check_fleet): там же
 # предел параллельности, общий контрольный замер и перепроверка промахов.
@@ -482,7 +487,23 @@ _skynet_tspu_summarize_server() {
             return
             ;;
         ERROR*)
-            echo "SKIP RIPE Atlas не ответил (${head_line})"
+            # Номер замера и точная причина уходят в лог (см. probe_log в
+            # _skynet_censorcheck_run_and_report), в отчёте - понятная фраза.
+            local reason="${head_line#ERROR }" counts
+            case "$reason" in
+                NO_DATA*)  echo "SKIP RIPE Atlas: нет результатов за время ожидания" ;;
+                API_POLL*) echo "SKIP RIPE Atlas: не удалось получить результаты (ошибка API)" ;;
+                MSM_DEAD*) echo "SKIP RIPE Atlas: замер не состоялся" ;;
+                CONTROL_FAILED*)
+                    counts="${reason#*:}"; counts="${counts%%:*}"
+                    echo "SKIP не удалось проверить: контрольный замер не прошёл, промахнулись ${counts%/*} из ${counts#*/} зондов"
+                    ;;
+                RETRY_FAILED*)
+                    counts="${reason#*:}"; counts="${counts%%:*}"
+                    echo "SKIP не удалось проверить: перепроверка не прошла, промахнулись ${counts%/*} из ${counts#*/} зондов"
+                    ;;
+                *) echo "SKIP RIPE Atlas не ответил (${head_line})" ;;
+            esac
             return
             ;;
         *)
@@ -714,6 +735,10 @@ _skynet_censorcheck_run_and_report() {
     # без HTML-экранирования и без IP (виджету он не нужен).
     local infra_state_lines=""
 
+    # Серверы, которые не удалось проверить из-за RIPE Atlas (не считая тех, где
+    # просто не слушает 443): при них нельзя писать в заголовке "всё чисто".
+    local unverified_n=0 raw_head
+
     # Серверы, не прошедшие проверку, и что ответили их зонды - для лога.
     # Строки SERVER/PROBE через таб; пишутся после загрузки имён операторов.
     local probe_log=""
@@ -747,6 +772,12 @@ _skynet_censorcheck_run_and_report() {
         detail="${result#* }"
         [[ "$detail" == "$result" ]] && detail=""
         detail=$(_skynet_censorcheck_html_escape "$detail")
+
+        raw_head=$(head -1 "${tmp_dir}/${idx}.out" 2>/dev/null)
+        if [[ "$raw_head" == ERROR* ]]; then
+            unverified_n=$((unverified_n + 1))
+            probe_log+="SERVER"$'\t'"${name}"$'\t'"${raw_head}"$'\n'
+        fi
 
         # У инфры "total"/skip_n/ok_n/blocked_n не считаются вовсе - это
         # счётчики для секции основного флота, инфра ведёт свои (infra_*).
@@ -977,6 +1008,9 @@ _skynet_censorcheck_run_and_report() {
     if [[ "$measured" -eq 0 && "$infra_measured" -eq 0 ]]; then
         verdict_emoji="⚪"
         verdict_text="нет данных"
+    elif [[ "$blocked_n" -eq 0 && "$infra_blocked_n" -eq 0 && "$unverified_n" -gt 0 ]]; then
+        verdict_emoji="🟡"
+        verdict_text="блокировок не найдено, не проверено: ${unverified_n}"
     elif [[ "$blocked_n" -eq 0 && "$infra_blocked_n" -eq 0 ]]; then
         verdict_emoji="🟢"
         verdict_text="всё чисто"
@@ -1186,7 +1220,7 @@ _skynet_censorcheck_check_address() {
         BLOCKED)   printf_warning "${target}: блокировка — ${detail}" ;;
         *)         printf_warning "${target}: не удалось померить — ${detail}" ;;
     esac
-    log "CensorCheck: ручная проверка ${target} (${ip}, SNI ${sni}) — ${result}"
+    log "CensorCheck: ручная проверка ${target} (${ip}, SNI ${sni}) — ${result} [$(head -1 "${tmp_dir}/1.out" 2>/dev/null)]"
 
     # Города и мобильная сеть - в том же виде, что раздел географии отчёта,
     # но операторы прямо в строке: сервер здесь один.

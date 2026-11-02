@@ -79,7 +79,12 @@ PARALLEL = max(1, int(os.environ.get("TSPU_PARALLEL", "10") or 10))
 # с цепочками сертификатов, килобайты на зонд - качаем один раз в конце.
 # Ждать ответа от всех ЗАПРОШЕННЫХ нельзя: зонд, отвалившийся за сутки
 # жизни кэша, RIPE не назначает, и замер всегда тянулся бы до таймаута.
-MEASURE_WAIT_S = 60
+#
+# Предел с запасом: обычно зонды отвечают за секунды, но с конца октября 2026
+# в часть прогонов первый ответ приходит через 67-122 секунды. Цикл выходит,
+# как только ответили все назначенные зонды, так что долго ждёт только такой
+# замер.
+MEASURE_WAIT_S = 180
 POLL_S = 3
 DEAD_STATUSES = {"No suitable probes", "Failed"}
 
@@ -587,11 +592,21 @@ def _http_error_detail(e):
     return " ".join(detail.split())[:300]
 
 
+def _poll_error(e):
+    """Короткое имя ошибки запроса к RIPE Atlas, одним словом - для строки ERROR."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP{e.code}"
+    return type(e).__name__
+
+
 def measure(api_key, target_ip, sni, probe_ids):
     """Одно sslcert-измерение по фиксированному списку зондов.
 
     Возвращает список результатов RIPE Atlas или бросает RuntimeError с
-    причиной, пригодной для показа пользователю.
+    причиной, пригодной для показа пользователю. Если замер уже создан,
+    причины различаются и несут его номер, чтобы случай можно было разобрать
+    по логу: NO_DATA - API отвечал, но результатов нет; API_POLL - последний
+    запрос к API не удался; MSM_DEAD - RIPE сам объявил замер несостоявшимся.
     """
     ids = ",".join(str(i) for i in probe_ids)
     payload = {
@@ -623,15 +638,19 @@ def measure(api_key, target_ip, sni, probe_ids):
 
     deadline = time.time() + MEASURE_WAIT_S
     expected = 0
+    last_error = ""
     while time.time() < deadline:
         time.sleep(POLL_S)
         try:
             m = _get(f"{API}/measurements/{msm_id}/"
                      f"?fields=status,probes_scheduled,participant_count")
-        except Exception:
+        except Exception as e:
+            last_error = _poll_error(e)
             continue
-        if (m.get("status") or {}).get("name") in DEAD_STATUSES:
-            raise RuntimeError("NO_DATA")
+        last_error = ""
+        status_name = (m.get("status") or {}).get("name")
+        if status_name in DEAD_STATUSES:
+            raise RuntimeError(f"MSM_DEAD:{status_name}:msm={msm_id}")
         scheduled = m.get("probes_scheduled") or 0
         expected = m.get("participant_count") or 0
         if scheduled and expected >= scheduled:
@@ -643,15 +662,18 @@ def measure(api_key, target_ip, sni, probe_ids):
     for attempt in range(3):
         try:
             results = _get(f"{API}/measurements/{msm_id}/results/")
-        except Exception:
-            pass
+            last_error = ""
+        except Exception as e:
+            last_error = _poll_error(e)
         if results and len(results) >= expected:
             break
         if attempt < 2:
             time.sleep(POLL_S)
 
     if not results:
-        raise RuntimeError("NO_DATA")
+        if last_error:
+            raise RuntimeError(f"API_POLL:{last_error}:msm={msm_id}")
+        raise RuntimeError(f"NO_DATA:msm={msm_id}")
     return results
 
 
@@ -659,7 +681,9 @@ def measure_control(api_key, probe_ids):
     """Контрольный замер: перебирает CONTROL_TARGETS до первой доступной цели.
 
     Отказ по лимиту одновременных измерений приходит ДО создания измерения,
-    поэтому неудачная попытка не стоит кредитов.
+    поэтому неудачная попытка не стоит кредитов. Если же замер создан и не
+    дал результата, кредиты уже потрачены, а перебор затянулся бы на несколько
+    пределов ожидания - следующую цель не пробуем.
     """
     last_error = "нет целей"
     for ip, sni in CONTROL_TARGETS:
@@ -667,6 +691,8 @@ def measure_control(api_key, probe_ids):
             return measure(api_key, ip, sni, probe_ids)
         except RuntimeError as e:
             last_error = str(e)
+            if "msm=" in last_error:
+                break
     raise RuntimeError(last_error)
 
 
@@ -735,7 +761,8 @@ def _answer_text(result):
     return " ".join(str(text).split())[:120]
 
 
-def summarize(meta, results, again_failed, control_ok, again_results=None):
+def summarize(meta, results, again_failed, control_ok, again_results=None,
+              control_error=None, retry_error=None):
     """Строки отчёта по одному серверу из основного замера и перепроверки.
 
     Зонд уходит в блокировку, только если промахнулся ОБА раза (основной
@@ -743,12 +770,23 @@ def summarize(meta, results, again_failed, control_ok, again_results=None):
     Отвалившийся зонд до контроля тоже не дотянется и из расчёта уйдёт
     целиком - ни в числитель, ни в знаменатель.
 
-    again_results - сырые ответы повтора (None, если повтор не удался):
-    из них и из основного замера берётся текст ошибки для строк PROBE.
+    Если у сервера есть промахи, а контроль или повтор не удался, разделить
+    блокировку и сбой зонда нечем. Такой сервер не проверен: считать его
+    доступным было бы ложной зеленью, заблокированным - ложной тревогой.
+
+    again_results - сырые ответы повтора: из них и из основного замера
+    берётся текст ошибки для строк PROBE.
     """
     ok_ids = _ok_ids(results)
     missed = _failed_ids(results)
     fault_n = sum(1 for r in results if classify(r) == "fault")
+
+    if missed:
+        seen = len(ok_ids) + len(missed)
+        if control_error:
+            return [f"ERROR CONTROL_FAILED:{len(missed)}/{seen}:{control_error}"]
+        if retry_error:
+            return [f"ERROR RETRY_FAILED:{len(missed)}/{seen}:{retry_error}"]
 
     confirmed, noise, dead = set(), set(), set()
     for pid in missed:
@@ -830,10 +868,9 @@ def summarize(meta, results, again_failed, control_ok, again_results=None):
         info = meta.get(pid, {})
         place = info.get("city") or ("моб. " + (info.get("place") or "?")
                                      if info.get("mobile") else "-")
-        again = (_answer_text(again_by_id.get(pid)) if again_results is not None
-                 else "повтор не выполнен")
         lines.append("\t".join(["PROBE", str(pid), str(info.get("asn") or 0), place,
-                                _answer_text(first_by_id.get(pid)), again]))
+                                _answer_text(first_by_id.get(pid)),
+                                _answer_text(again_by_id.get(pid))]))
     return lines
 
 
@@ -887,37 +924,39 @@ def check_fleet(api_key, sni, targets, port_check=True):
     missed = {key: _failed_ids(res) for key, res in results.items()}
     all_missed = sorted(set().union(*missed.values())) if missed else []
 
-    again_failed, again_results = {}, {}
+    again_failed, again_results, retry_errors = {}, {}, {}
     control_ok = set()
+    control_error = None
     if all_missed:
         ip_of = dict(targets)
 
         def retry(key):
             try:
                 res = measure(api_key, ip_of[key], sni, sorted(missed[key]))
-                return key, _failed_ids(res), res
-            except RuntimeError:
-                return key, set(missed[key]), None
+                return key, _failed_ids(res), res, None
+            except RuntimeError as e:
+                return key, set(), None, str(e)
 
         with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
             # Контроль - первым в очередь: он один на всех и нужен каждому.
             control = pool.submit(measure_control, api_key, all_missed)
             retries = [pool.submit(retry, key) for key in missed if missed[key]]
             for f in retries:
-                key, failed, res = f.result()
+                key, failed, res, error = f.result()
                 again_failed[key] = failed
                 again_results[key] = res
+                retry_errors[key] = error
             try:
                 control_ok = _ok_ids(control.result())
-            except RuntimeError:
-                # Контроль не удался - подтверждать живость нечем. Считаем
-                # промахи неподтверждёнными, а не блокировкой: ошибиться в
-                # сторону "доступно" здесь безопаснее.
-                control_ok = set()
+            except RuntimeError as e:
+                # Подтверждать живость зондов нечем: серверы с промахами
+                # получат статус "не проверен" (см. summarize).
+                control_error = str(e)
 
     for key, res in results.items():
         out[key] = summarize(meta, res, again_failed.get(key, set()), control_ok,
-                             again_results.get(key))
+                             again_results.get(key), control_error,
+                             retry_errors.get(key))
     return out
 
 
