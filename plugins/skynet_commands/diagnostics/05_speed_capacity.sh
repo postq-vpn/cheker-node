@@ -26,45 +26,59 @@ _ensure_speedtest() {
         return 0
     fi
 
-    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        echo "Не найдены curl или tar: установка Speedtest невозможна."
+    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+        echo "Не найдены curl, tar или sha256sum: установка Speedtest невозможна."
         return 1
     fi
 
-    local arch tgz_name
+    # Суммы архивов версии 1.2.0 с сайта Ookla: бинарник запускается от root на
+    # всём флоте, а зеркало чужое. Те же суммы - в modules/local/local_care.sh.
+    local arch tgz_name tgz_sha256
     arch=$(uname -m)
     case "$arch" in
-        x86_64)  tgz_name="ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
-        aarch64) tgz_name="ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
+        x86_64)
+            tgz_name="ookla-speedtest-1.2.0-linux-x86_64.tgz"
+            tgz_sha256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
+            ;;
+        aarch64)
+            tgz_name="ookla-speedtest-1.2.0-linux-aarch64.tgz"
+            tgz_sha256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3"
+            ;;
         *)
             echo "Неподдерживаемая архитектура: ${arch}. Установка Speedtest невозможна."
             return 1
             ;;
     esac
 
-    local tgz="/tmp/reshala_speedtest_$$.tgz"
-    local unpack_dir="/tmp/reshala_speedtest_$$"
+    local work_dir
+    work_dir=$(mktemp -d) || return 1
+    local tgz="${work_dir}/speedtest.tgz"
 
     # Официальный сайт Ookla часто закрыт для российских IP — тогда идём
     # на зеркало (та же пара ссылок, что и в локальном замере).
-    if ! curl -fsL --connect-timeout 15 "${SPEEDTEST_MIRROR_1}/${tgz_name}" -o "$tgz"; then
-        if ! curl -fsL --connect-timeout 15 "${SPEEDTEST_MIRROR_2}/${tgz_name}" -o "$tgz"; then
-            rm -f "$tgz"
-            echo "Не удалось загрузить Speedtest ни с официального сайта, ни с зеркала."
-            return 1
+    local mirror verified=0
+    for mirror in "$SPEEDTEST_MIRROR_1" "$SPEEDTEST_MIRROR_2"; do
+        if curl -fsL --connect-timeout 15 "${mirror}/${tgz_name}" -o "$tgz" \
+            && [[ "$(sha256sum "$tgz" | cut -d' ' -f1)" == "$tgz_sha256" ]]; then
+            verified=1
+            break
         fi
+    done
+    if [[ "$verified" -ne 1 ]]; then
+        rm -rf "$work_dir"
+        echo "Не удалось загрузить Speedtest: источники недоступны или контрольная сумма не совпала."
+        return 1
     fi
 
-    mkdir -p "$unpack_dir"
-    if ! tar -xzf "$tgz" -C "$unpack_dir" 2>/dev/null || [[ ! -f "${unpack_dir}/speedtest" ]]; then
-        rm -rf "$tgz" "$unpack_dir"
+    if ! tar -xzf "$tgz" -C "$work_dir" speedtest 2>/dev/null || [[ ! -f "${work_dir}/speedtest" ]]; then
+        rm -rf "$work_dir"
         echo "Архив Speedtest повреждён: исполняемый файл не найден."
         return 1
     fi
 
-    mv "${unpack_dir}/speedtest" /usr/local/bin/speedtest
+    mv "${work_dir}/speedtest" /usr/local/bin/speedtest
     chmod +x /usr/local/bin/speedtest
-    rm -rf "$tgz" "$unpack_dir"
+    rm -rf "$work_dir"
 
     # bash кэширует пути команд: без hash -r только что поставленный
     # бинарник может «не найтись» в этом же процессе.

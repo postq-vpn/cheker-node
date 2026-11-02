@@ -10,7 +10,13 @@ run() {
         echo "Утилита wget не найдена на сервере."
         return 1
     fi
-    wget -qO- censorcheck.tlab.pw | bash
+    # Страница ошибки вместо скрипта запускаться не должна.
+    local script
+    if ! script=$(wget -qO- censorcheck.tlab.pw) || [[ -z "$script" || "$script" == "<"* ]]; then
+        echo "Не удалось скачать скрипт CensorCheck."
+        return 1
+    fi
+    bash <<< "$script"
 }
 
 run

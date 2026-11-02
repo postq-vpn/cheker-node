@@ -232,34 +232,47 @@ _ensure_speedtest_ok() {
     local arch; arch=$(uname -m)
     local url1=""
     local url2=""
+    # Суммы архивов версии 1.2.0 с сайта Ookla: зеркало чужое, а бинарник
+    # запускается от root. Те же суммы - в плагине 05_speed_capacity.sh.
+    local tgz_sha256=""
     case "$arch" in 
         x86_64) 
             url1="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" 
             url2="https://dl.lamp.sh/files/ookla-speedtest-1.2.0-linux-x86_64.tgz"
+            tgz_sha256="5690596c54ff9bed63fa3732f818a05dbc2db19ad36ed68f21ca5f64d5cfeeb7"
             ;; 
         aarch64) 
             url1="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" 
             url2="https://dl.lamp.sh/files/ookla-speedtest-1.2.0-linux-aarch64.tgz"
+            tgz_sha256="3953d231da3783e2bf8904b6dd72767c5c6e533e163d3742fd0437affa431bd3"
             ;; 
         *) err "Неизвестная архитектура: $arch."; return 1;; 
     esac
     
     info "Качаю официальный бинарник для $arch..."
     
+    local work_dir; work_dir=$(mktemp -d) || return 1
+    local tgz="${work_dir}/speedtest.tgz"
+
     # Сначала пробуем офф сайт, если он заблокирован (например в РФ) - используем резервное зеркало (lamp.sh)
-    if ! curl -sL "$url1" -o /tmp/speedtest.tgz; then 
+    if ! curl -fsL "$url1" -o "$tgz" || [[ "$(sha256sum "$tgz" | cut -d' ' -f1)" != "$tgz_sha256" ]]; then
         warn "Официальный сайт недоступен. Пробую резервное зеркало (lamp.sh)..."
-        if ! curl -sL "$url2" -o /tmp/speedtest.tgz; then
-            err "Не удалось скачать архив ни с одного из зеркал."
+        if ! curl -fsL "$url2" -o "$tgz" || [[ "$(sha256sum "$tgz" | cut -d' ' -f1)" != "$tgz_sha256" ]]; then
+            rm -rf "$work_dir"
+            err "Не удалось скачать архив: источники недоступны или контрольная сумма не совпала."
             return 1
         fi
     fi
     
     info "Распаковываю и устанавливаю..."
-    tar -xzf /tmp/speedtest.tgz -C /tmp
-    mv /tmp/speedtest /usr/local/bin/
+    if ! tar -xzf "$tgz" -C "$work_dir" speedtest 2>/dev/null || [[ ! -f "${work_dir}/speedtest" ]]; then
+        rm -rf "$work_dir"
+        err "Архив Speedtest повреждён: исполняемый файл не найден."
+        return 1
+    fi
+    mv "${work_dir}/speedtest" /usr/local/bin/
     chmod +x /usr/local/bin/speedtest
-    rm -f /tmp/speedtest.tgz /tmp/speedtest.md /tmp/speedtest.5
+    rm -rf "$work_dir"
     
     if command -v speedtest &>/dev/null; then 
         ok "Speedtest успешно установлен."
@@ -268,6 +281,19 @@ _ensure_speedtest_ok() {
         err "Ошибка при установке бинарника."
         return 1
     fi
+}
+
+# Запускает внешний bench-скрипт. Страница ошибки вместо скрипта запускаться
+# не должна.
+_run_remote_bench() {
+    local url="$1" script
+    echo "Загрузка скрипта..."
+    if ! script=$(wget -qO- "$url") || [[ -z "$script" || "$script" == "<"* ]]; then
+        err "Не удалось скачать скрипт: ${url}"
+        wait_for_enter
+        return 1
+    fi
+    bash <<< "$script"
 }
 
 _run_speedtest() {
@@ -320,13 +346,13 @@ _run_speedtest() {
                 ;;
             2)
                 # Внешние bench-скрипты сами показывают паузу в конце — не дублируем wait_for_enter
-                clear; menu_header "🌍 Запуск Bench.sh"; echo "Загрузка скрипта..."; wget -qO- bench.sh | bash ;;
+                clear; menu_header "🌍 Запуск Bench.sh"; _run_remote_bench "bench.sh" ;;
             3)
-                clear; menu_header "🌍 Запуск speed.tlab.pw"; echo "Загрузка скрипта..."; wget -qO- speed.tlab.pw | bash ;;
+                clear; menu_header "🌍 Запуск speed.tlab.pw"; _run_remote_bench "speed.tlab.pw" ;;
             4)
-                clear; menu_header "🇷🇺 Запуск bench.gig.ovh"; echo "Загрузка скрипта..."; wget -qO- bench.gig.ovh | bash ;;
+                clear; menu_header "🇷🇺 Запуск bench.gig.ovh"; _run_remote_bench "bench.gig.ovh" ;;
             5)
-                clear; menu_header "🇷🇺 Запуск bench.tlab.pw"; echo "Загрузка скрипта..."; wget -qO- bench.tlab.pw | bash ;;
+                clear; menu_header "🇷🇺 Запуск bench.tlab.pw"; _run_remote_bench "bench.tlab.pw" ;;
             [bB]) break ;;
             *) err "Неверный выбор."; sleep 1 ;;
         esac
