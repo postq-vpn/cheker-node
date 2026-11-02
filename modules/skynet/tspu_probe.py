@@ -86,6 +86,8 @@ PARALLEL = max(1, int(os.environ.get("TSPU_PARALLEL", "10") or 10))
 # замер.
 MEASURE_WAIT_S = 180
 POLL_S = 3
+RESULT_POLL_S = 5
+RESULT_SETTLE_S = 30
 DEAD_STATUSES = {"No suitable probes", "Failed"}
 
 # Как набирать выборку:
@@ -656,19 +658,27 @@ def measure(api_key, target_ip, sni, probe_ids):
         if scheduled and expected >= scheduled:
             break
 
-    # Счётчик участников обновляется чуть раньше, чем результат виден в
-    # выдаче - поэтому пара добирающих запросов, если пришло меньше.
+    # Участник засчитывается, когда зонд начал работу, а результат появляется в
+    # выдаче на десятки секунд позже. Поэтому ждём сами результаты: пока не
+    # придут все или пока они не перестанут прибывать (часть участников не
+    # присылает результат вообще). Пока нет ни одного - ждём до предела.
     results = []
-    for attempt in range(3):
+    grown_at = time.time()
+    while True:
         try:
-            results = _get(f"{API}/measurements/{msm_id}/results/")
+            fresh = _get(f"{API}/measurements/{msm_id}/results/")
             last_error = ""
+            if len(fresh) > len(results):
+                results = fresh
+                grown_at = time.time()
         except Exception as e:
             last_error = _poll_error(e)
-        if results and len(results) >= expected:
+        now = time.time()
+        if expected and len(results) >= expected:
             break
-        if attempt < 2:
-            time.sleep(POLL_S)
+        if now >= deadline or (results and now - grown_at >= RESULT_SETTLE_S):
+            break
+        time.sleep(RESULT_POLL_S)
 
     if not results:
         if last_error:
