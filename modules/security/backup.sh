@@ -6,12 +6,14 @@
 # backup.sh - Бэкап и восстановление конфигураций безопасности
 #
 
-BACKUP_DIR_SEC="${SCRIPT_DIR}/modules/security/backups"
+BACKUP_DIR_SEC="$RESHALA_BACKUP_DIR"
 SYSCTL_CONF_FILE="/etc/sysctl.d/99-reshala-hardening.conf"
 F2B_WHITELIST_FILE="/etc/reshala/fail2ban-whitelist.txt"
 
 show_backup_menu() {
+    # В архивах .env и authorized_keys: каталог только для root.
     run_cmd mkdir -p "$BACKUP_DIR_SEC"
+    run_cmd chmod 700 "$BACKUP_DIR_SEC"
     while true; do
         clear
         enable_graceful_ctrlc
@@ -69,7 +71,7 @@ _backup_create() {
         "$F2B_WHITELIST_FILE"
         "/etc/reshala/global-whitelist.txt"
         "/etc/reshala/geoblock/countries.txt"
-        "${SCRIPT_DIR}/config/reshala.conf"
+        "$RESHALA_SETTINGS_FILE"
         "/root/.ssh/authorized_keys"
     )
     local dirs_to_backup=(
@@ -199,10 +201,13 @@ _backup_restore() {
         ok "Настройки ядра восстановлены."
     fi
     
-    # Reshala config
-    if [[ -f "$restore_source/reshala.conf" ]]; then
-        run_cmd cp "$restore_source/reshala.conf" "${SCRIPT_DIR}/config/"
-        ok "Главный конфиг reshala.conf восстановлен."
+    # Настройки Решалы. В архивах старых версий вместо них лежит reshala.conf.
+    if [[ -f "$restore_source/settings.conf" ]]; then
+        run_cmd cp "$restore_source/settings.conf" "$RESHALA_SETTINGS_FILE"
+        ok "Настройки Решалы восстановлены."
+    elif [[ -f "$restore_source/reshala.conf" ]]; then
+        _config_import_from "$restore_source/reshala.conf" "${SCRIPT_DIR}/config/reshala.conf"
+        ok "Настройки Решалы восстановлены из старого reshala.conf."
     fi
 
     # SSH Keys

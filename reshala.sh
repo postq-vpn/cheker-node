@@ -48,6 +48,11 @@ else
     exit 1
 fi
 
+# Настройки пользователя перекрывают умолчания из config/reshala.conf (см. common.sh).
+if [ -f "$RESHALA_SETTINGS_FILE" ]; then
+    source "$RESHALA_SETTINGS_FILE"
+fi
+
 # Подключаем секреты (.env), если он уже существует. Хранится в /etc/reshala,
 # отдельно от config/reshala.conf, поэтому переживает переустановку/обновление.
 if [ -f "$RESHALA_ENV_FILE" ]; then
@@ -307,7 +312,7 @@ main() {
     fi
 
     if [[ "${1:-}" == "install" ]]; then
-        source "${SCRIPT_DIR}/modules/core/self_update.sh" && install_script
+        source "${SCRIPT_DIR}/modules/core/self_update.sh" && install_script || exit 1
         ensure_package "sudo"
         exit 0
     fi

@@ -5,11 +5,12 @@
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && exit 1 # Защита от прямого запуска
 
-UPDATER_CONF="${SCRIPT_DIR}/config/updater.conf"
+UPDATER_CONF="$RESHALA_UPDATER_CONF"
 
 # Инициализация конфига
 init_updater_config() {
     if [ ! -f "$UPDATER_CONF" ]; then
+        mkdir -p "$(dirname "$UPDATER_CONF")"
         touch "$UPDATER_CONF"
         # Формат: PATH|STRATEGY|LABEL
         echo "# PATH|STRATEGY|LABEL" > "$UPDATER_CONF"

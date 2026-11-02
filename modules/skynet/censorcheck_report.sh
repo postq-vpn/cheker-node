@@ -1571,7 +1571,7 @@ _skynet_censorcheck_probe_set_menu() {
 }
 
 # Какие серверы флота участвуют в проверке ТСПУ. Исключённые хранятся в
-# TSPU_EXCLUDED_SERVERS (config/reshala.conf) как список имён через запятую -
+# TSPU_EXCLUDED_SERVERS (настройки, см. set_config_var) как список имён через запятую -
 # тот же приём, что ENABLED_WIDGETS в modules/ui/widget_manager.sh. Привязка
 # идёт по имени сервера (уникальный ключ в базе флота).
 _skynet_censorcheck_servers_menu() {

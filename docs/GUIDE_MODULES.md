@@ -23,7 +23,7 @@
   - `run_module <module_path> <function> [args...]`
   - она делает `source` указанного файла модуля и вызывает функцию.
 - Любой модуль **обязан** рассчитывать на то, что перед его вызовом уже загружены:
-  - `config/reshala.conf` (глобальные константы);
+  - `config/reshala.conf` (глобальные константы и умолчания; настройки пользователя лежат в `/etc/reshala/settings.conf`);
   - `modules/core/common.sh` (цвета, хелперы меню, `run_cmd`, `safe_read`, `ask_yes_no` и т.д.).
 
 **Никогда** не запускаем модули напрямую (`bash modules/local/my_feature.sh`) — только через `run_module`.

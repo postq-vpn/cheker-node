@@ -88,8 +88,9 @@ _kernel_apply() {
     fi
     
     local backup_dir
-    backup_dir="${SCRIPT_DIR}/modules/security/backups"
+    backup_dir="$RESHALA_BACKUP_DIR"
     run_cmd mkdir -p "$backup_dir"
+    run_cmd chmod 700 "$backup_dir"
     
     info "Создаю бэкап текущих sysctl настроек..."
     run_cmd sysctl -a > "$backup_dir/sysctl.backup_$(date +%s)" 2>/dev/null

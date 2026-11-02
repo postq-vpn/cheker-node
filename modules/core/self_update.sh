@@ -7,6 +7,66 @@
 #
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && exit 1 # Защита от прямого запуска
 
+# Переносит данные из установки версии, которая ещё хранила их внутри
+# /opt/reshala. Такую версию узнаём по коду: новая знает RESHALA_SETTINGS_FILE.
+# Запускается один раз: дальше старое дерево уже новое, и разница его конфига с
+# умолчаниями - это смена умолчаний между версиями, а не правки пользователя.
+_migrate_legacy_data() {
+    local old_dir="$1" new_dir="$2"
+    grep -q "RESHALA_SETTINGS_FILE" "${old_dir}/modules/core/common.sh" 2>/dev/null && return 0
+
+    if [[ -f "${old_dir}/config/reshala.conf" && ! -f "$RESHALA_SETTINGS_FILE" ]]; then
+        _config_import_from "${old_dir}/config/reshala.conf" "${new_dir}/config/reshala.conf" || return 1
+    fi
+    if [[ ! -f "$RESHALA_UPDATER_CONF" ]] && grep -qv '^#' "${old_dir}/config/updater.conf" 2>/dev/null; then
+        cp "${old_dir}/config/updater.conf" "$RESHALA_UPDATER_CONF" || return 1
+    fi
+    if [[ -d "${old_dir}/modules/security/backups" ]]; then
+        # chmod после cp: "cp -a каталог/." переносит и права самого каталога.
+        mkdir -p "$RESHALA_BACKUP_DIR" \
+            && cp -a "${old_dir}/modules/security/backups/." "$RESHALA_BACKUP_DIR/" \
+            && chmod 700 "$RESHALA_BACKUP_DIR" || return 1
+    fi
+}
+
+# Ставит версию из src_dir в /opt/reshala. Сначала она целиком копируется рядом
+# и только потом подменяет рабочую: при любой ошибке установка остаётся как
+# была. src_dir может быть самим /opt/reshala ("reshala install").
+_deploy_release() {
+    local src_dir="$1"
+    local INSTALL_DIR="/opt/reshala"
+    local new_dir="${INSTALL_DIR}.new.$$" old_dir="${INSTALL_DIR}.old.$$"
+
+    run_cmd rm -rf "$new_dir"
+    if ! run_cmd mkdir -p "$new_dir" || ! run_cmd cp -a "${src_dir}/." "${new_dir}/" \
+        || [[ ! -f "${new_dir}/reshala.sh" || ! -f "${new_dir}/modules/core/common.sh" ]]; then
+        run_cmd rm -rf "$new_dir"
+        err "Не удалось подготовить файлы новой версии. Установка не изменена."
+        return 1
+    fi
+    run_cmd chmod +x "${new_dir}/reshala.sh"
+
+    if [[ -d "$INSTALL_DIR" ]]; then
+        if ! _migrate_legacy_data "$INSTALL_DIR" "$new_dir"; then
+            run_cmd rm -rf "$new_dir"
+            err "Не удалось перенести настройки и бэкапы старой версии. Установка не изменена."
+            return 1
+        fi
+        if ! run_cmd mv "$INSTALL_DIR" "$old_dir"; then
+            run_cmd rm -rf "$new_dir"
+            err "Не удалось заменить ${INSTALL_DIR}. Установка не изменена."
+            return 1
+        fi
+    fi
+    if ! run_cmd mv "$new_dir" "$INSTALL_DIR"; then
+        [[ -d "$old_dir" ]] && run_cmd mv "$old_dir" "$INSTALL_DIR"
+        run_cmd rm -rf "$new_dir"
+        err "Не удалось заменить ${INSTALL_DIR}. Старая версия возвращена на место."
+        return 1
+    fi
+    run_cmd rm -rf "$old_dir"
+}
+
 _perform_install_or_update() {
     local mode=${1:-install} # 'install' or 'update'
     
@@ -26,13 +86,12 @@ _perform_install_or_update() {
 
     local INSTALL_DIR="/opt/reshala"
     printf_info "Разворачиваю файлы в ${INSTALL_DIR}..."
-    run_cmd rm -rf "$INSTALL_DIR"
-    run_cmd mkdir -p "$INSTALL_DIR"
-    run_cmd cp -r "${TEMP_DIR}/." "$INSTALL_DIR/"
-    run_cmd chmod +x "${INSTALL_DIR}/reshala.sh"
+    if ! _deploy_release "$TEMP_DIR"; then
+        rm -f "$TEMP_ARCHIVE"; rm -rf "$TEMP_DIR"; return 1
+    fi
 
     run_cmd ln -sf "${INSTALL_DIR}/reshala.sh" "$INSTALL_PATH"
-    
+
     rm -f "$TEMP_ARCHIVE"; rm -rf "$TEMP_DIR"
     return 0
 }
@@ -49,15 +108,12 @@ install_script() {
     local INSTALL_DIR="/opt/reshala"
     
     info "Копирую файлы из временной директории в ${INSTALL_DIR}..."
-    run_cmd rm -rf "$INSTALL_DIR" # Чистим старую установку на всякий случай
-    run_cmd mkdir -p "$INSTALL_DIR"
     # Вот ключевое изменение! Копируем из SCRIPT_DIR, а не качаем заново.
-    run_cmd cp -r "${SCRIPT_DIR}/." "${INSTALL_DIR}/"
-    
+    _deploy_release "$SCRIPT_DIR" || return 1
+
     info "Создаю системную команду 'reshala' (через symlink на /opt/reshala/reshala.sh)..."
     run_cmd ln -sf "${INSTALL_DIR}/reshala.sh" "$INSTALL_PATH"
-    run_cmd chmod +x "${INSTALL_DIR}/reshala.sh"
-    
+
     # Добавляем алиас для root, если он нужен
     if ! grep -q "alias reshala='sudo reshala'" /root/.bashrc 2>/dev/null; then
         echo "alias reshala='sudo reshala'" | run_cmd tee -a /root/.bashrc >/dev/null

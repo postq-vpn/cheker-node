@@ -131,7 +131,7 @@ show_security_menu() {
 - **Логирование:**
   - Пишите в лог-файл проекта через `log "Мое сообщение для лога"`.
 - **Конфигурация:**
-  - Читайте и пишите в `config/reshala.conf` только через `get_config_var "KEY"` и `set_config_var "KEY" "VALUE"`.
+  - Настройки читайте и пишите только через `get_config_var "KEY"` и `set_config_var "KEY" "VALUE"`: значения хранятся в `/etc/reshala/settings.conf` и перекрывают умолчания из `config/reshala.conf`.
 - **Зависимости:**
   - Для проверки и установки утилит (`curl`, `jq`) используйте `ensure_dependencies "curl" "jq"`.
 

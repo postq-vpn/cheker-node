@@ -526,23 +526,74 @@ ensure_package() {
     return 0
 }
 
+# --- Настройки пользователя ---
+# config/reshala.conf приезжает с кодом и при обновлении заменяется целиком,
+# поэтому всё, что пользователь меняет, лежит отдельно: значения отсюда
+# перекрывают умолчания из config/reshala.conf.
+RESHALA_SETTINGS_FILE="/etc/reshala/settings.conf"
+RESHALA_UPDATER_CONF="/etc/reshala/updater.conf"
+# Не в /etc/reshala: бэкап сам копирует этот каталог и вложил бы в себя
+# все предыдущие архивы.
+RESHALA_BACKUP_DIR="/var/backups/reshala/security"
+
+# Значение из строки конфига (то, что после "="): в settings.conf оно в
+# одинарных кавычках, в config/reshala.conf - в двойных.
+_config_parse_value() {
+    local value="$1"
+    if [[ "$value" == \'*\' && ${#value} -ge 2 ]]; then
+        value="${value:1:${#value}-2}"
+        value="${value//"'\''"/"'"}"
+    else
+        value="${value//\"/}"
+    fi
+    printf '%s' "$value"
+}
+
+# Значение в одинарных кавычках: файл потом сорсится как shell, и имя сервера
+# с $(...) или кавычкой не должно ни выполниться, ни сломать файл. Запись через
+# временный файл, а не sed: спецсимволы в значении не трогают выражение, а
+# оборванная запись не портит настройки.
 set_config_var() {
     local key="$1"
-    local value="$2"
-    local config_file="${SCRIPT_DIR}/config/reshala.conf"
-    if grep -q "^${key}=" "$config_file" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$config_file"
+    local value="${2//$'\n'/ }"
+    local file="$RESHALA_SETTINGS_FILE" tmp
+    mkdir -p "$(dirname "$file")" || return 1
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    grep -v "^${key}=" "$file" > "$tmp" 2>/dev/null
+    if printf "%s='%s'\n" "$key" "${value//"'"/"'\''"}" >> "$tmp"; then
+        mv -f "$tmp" "$file"
     else
-        echo "${key}=\"${value}\"" >> "$config_file"
+        rm -f "$tmp"
+        return 1
     fi
 }
 
 get_config_var() {
-    local key="$1"
-    local config_file="${SCRIPT_DIR}/config/reshala.conf"
-    if [ -f "$config_file" ]; then
-        grep "^${key}=" "$config_file" 2>/dev/null | cut -d'=' -f2- | sed 's/"//g'
-    fi
+    local key="$1" file line
+    for file in "$RESHALA_SETTINGS_FILE" "${SCRIPT_DIR}/config/reshala.conf"; do
+        [[ -f "$file" ]] || continue
+        line=$(grep "^${key}=" "$file" 2>/dev/null | tail -n1)
+        if [[ -n "$line" ]]; then
+            _config_parse_value "${line#*=}"
+            echo
+            return 0
+        fi
+    done
+}
+
+# Переносит в настройки значения из старого конфига, отличающиеся от умолчаний.
+# Сам конфиг не сорсится: строки разбираются как текст.
+_config_import_from() {
+    local old_conf="$1" defaults_conf="$2" line key value default
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        key="${line%%=*}"
+        value=$(_config_parse_value "${line#*=}")
+        default=$(grep "^${key}=" "$defaults_conf" 2>/dev/null | tail -n1)
+        default=$(_config_parse_value "${default#*=}")
+        [[ "$value" == "$default" ]] && continue
+        set_config_var "$key" "$value" || return 1
+    done < "$old_conf"
 }
 
 # --- Секреты (.env) ---
