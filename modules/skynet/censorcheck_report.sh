@@ -646,6 +646,8 @@ _skynet_censorcheck_run_and_report() {
     local verbose=1
     [[ "$mode" == "--cron" ]] && verbose=0
 
+    _skynet_censorcheck_refresh_cron
+
     ensure_package "curl" >/dev/null 2>&1 || true
     ensure_package "python3" >/dev/null 2>&1 || true
 
@@ -1290,8 +1292,9 @@ _skynet_censorcheck_cron_has_tz() {
 # Переводит московское время в локальное время сервера — для cron без CRON_TZ.
 # Считаем арифметикой по текущему смещению сервера (date +%z), а не через
 # `date -d "TZ=..."`: последнее есть только в GNU date. Печатает "часы минуты".
-# Если сам сервер живёт в зоне с переходом на лето, задание после перевода
-# стрелок сдвинется на час — на UTC-серверах (типичный VPS) этого не бывает.
+# Смещение действует только сейчас: в зоне с переходом на летнее время часы
+# отсюда через полгода устареют, поэтому в cron без CRON_TZ идёт только минута
+# (см. _skynet_censorcheck_write_cron).
 _skynet_censorcheck_msk_to_local() {
     local hour="$1" minute="$2"
     local z; z=$(date +%z)   # вида +0300 / -0500
@@ -1332,21 +1335,24 @@ _skynet_censorcheck_write_cron() {
     if [[ "$has_tz" -eq 1 ]]; then
         tz_line="CRON_TZ=${RESHALA_TZ}"
     else
-        tz_line="# Этот cron не понимает CRON_TZ, поэтому поля времени ниже записаны"$'\n'"# по часовому поясу сервера, а не по Москве (МСК — в комментариях)."
+        tz_line="# Этот cron не понимает CRON_TZ, поэтому задания запускаются каждый час и"$'\n'"# сами проверяют час по Москве: пояс сервера и перевод часов на них не влияют."$'\n'"# reshala-msk-guard"
     fi
 
     local body="" t hour minute cron_hour cron_minute
+    local offset_s=$(( RESHALA_TZ_OFFSET_MIN * 60 ))
     while IFS= read -r t; do
         [[ -n "$t" ]] || continue
         hour="${t%%:*}"; minute="${t##*:}"
-        if [[ "$has_tz" -eq 1 ]]; then
-            cron_hour="$hour"; cron_minute="$minute"
-        else
-            read -r cron_hour cron_minute <<< "$(_skynet_censorcheck_msk_to_local "$hour" "$minute")"
-        fi
         # 10# — иначе "09" уедет в арифметику как восьмеричное и сломает запись.
         body+="# reshala-msk-time ${t}"$'\n'
-        body+="$((10#$cron_minute)) $((10#$cron_hour)) * * * root ${exec_path} censorcheck-report >> ${LOGFILE} 2>&1"$'\n'
+        if [[ "$has_tz" -eq 1 ]]; then
+            body+="$((10#$minute)) $((10#$hour)) * * * root ${exec_path} censorcheck-report >> ${LOGFILE} 2>&1"$'\n'
+        else
+            # Час считаем от времени Unix: это не зависит от пояса сервера и
+            # tzdata. "\%" - так в cron записывается знак процента.
+            read -r cron_hour cron_minute <<< "$(_skynet_censorcheck_msk_to_local "$hour" "$minute")"
+            body+="$((10#$cron_minute)) * * * * root [ \$(( (\$(date +\\%s) + ${offset_s}) / 3600 % 24 )) -eq $((10#$hour)) ] && ${exec_path} censorcheck-report >> ${LOGFILE} 2>&1"$'\n'
+        fi
     done < <(printf '%s\n' "$@" | sort -u)
     body="${body%$'\n'}"   # завершающий перевод строки добавит сам heredoc
 
@@ -1359,6 +1365,17 @@ ${tz_line}
 ${body}
 EOF
     chmod 644 "$_CENSORCHECK_CRON_FILE"
+}
+
+# Переписывает расписание старого формата, где часы cron записаны по поясу
+# сервера и сдвигаются при переводе часов. Времена берёт из меток в самом файле.
+_skynet_censorcheck_refresh_cron() {
+    [[ -f "$_CENSORCHECK_CRON_FILE" ]] || return 0
+    grep -qE '^CRON_TZ=|reshala-msk-guard' "$_CENSORCHECK_CRON_FILE" && return 0
+    local -a times=(); mapfile -t times < <(_skynet_censorcheck_times)
+    [[ ${#times[@]} -gt 0 ]] || return 0
+    _skynet_censorcheck_write_cron "${times[@]}"
+    log "CensorCheck: расписание переписано, запуск теперь не зависит от пояса сервера."
 }
 
 _skynet_censorcheck_add_time() {
@@ -1688,6 +1705,7 @@ _skynet_censorcheck_schedule_menu() {
 }
 
 _skynet_censorcheck_menu() {
+    _skynet_censorcheck_refresh_cron
     enable_graceful_ctrlc
     while true; do
         clear
