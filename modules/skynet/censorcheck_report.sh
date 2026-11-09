@@ -1335,7 +1335,7 @@ _skynet_censorcheck_write_cron() {
     if [[ "$has_tz" -eq 1 ]]; then
         tz_line="CRON_TZ=${RESHALA_TZ}"
     else
-        tz_line="# Этот cron не понимает CRON_TZ, поэтому задания запускаются каждый час и"$'\n'"# сами проверяют час по Москве: пояс сервера и перевод часов на них не влияют."$'\n'"# reshala-msk-guard"
+        tz_line="# Этот cron не понимает CRON_TZ, поэтому задания запускаются каждый час и"$'\n'"# сами проверяют час по Москве: пояс сервера и перевод часов на них не влияют."$'\n'"# reshala-msk-guard-v2"
     fi
 
     local body="" t hour minute cron_hour cron_minute
@@ -1349,9 +1349,11 @@ _skynet_censorcheck_write_cron() {
             body+="$((10#$minute)) $((10#$hour)) * * * root ${exec_path} censorcheck-report >> ${LOGFILE} 2>&1"$'\n'
         else
             # Час считаем от времени Unix: это не зависит от пояса сервера и
-            # tzdata. "\%" - так в cron записывается знак процента.
+            # tzdata. Каждый знак процента в cron пишется как "\%", включая
+            # остаток от деления: голый % cron считает концом команды и
+            # отрезает остальное, и задание молча падает (так было в v3.180).
             read -r cron_hour cron_minute <<< "$(_skynet_censorcheck_msk_to_local "$hour" "$minute")"
-            body+="$((10#$cron_minute)) * * * * root [ \$(( (\$(date +\\%s) + ${offset_s}) / 3600 % 24 )) -eq $((10#$hour)) ] && ${exec_path} censorcheck-report >> ${LOGFILE} 2>&1"$'\n'
+            body+="$((10#$cron_minute)) * * * * root [ \$(( (\$(date +\\%s) + ${offset_s}) / 3600 \\% 24 )) -eq $((10#$hour)) ] && ${exec_path} censorcheck-report >> ${LOGFILE} 2>&1"$'\n'
         fi
     done < <(printf '%s\n' "$@" | sort -u)
     body="${body%$'\n'}"   # завершающий перевод строки добавит сам heredoc
@@ -1367,11 +1369,13 @@ EOF
     chmod 644 "$_CENSORCHECK_CRON_FILE"
 }
 
-# Переписывает расписание старого формата, где часы cron записаны по поясу
-# сервера и сдвигаются при переводе часов. Времена берёт из меток в самом файле.
+# Переписывает расписание старых форматов. Времена берёт из меток в самом файле:
+# - часы cron записаны по поясу сервера и сдвигаются при переводе часов;
+# - "reshala-msk-guard" из v3.180-v3.181: неэкранированный % в проверке часа,
+#   cron обрезал по нему команду, и отчёт не запускался вовсе.
 _skynet_censorcheck_refresh_cron() {
     [[ -f "$_CENSORCHECK_CRON_FILE" ]] || return 0
-    grep -qE '^CRON_TZ=|reshala-msk-guard' "$_CENSORCHECK_CRON_FILE" && return 0
+    grep -qE '^CRON_TZ=|reshala-msk-guard-v2' "$_CENSORCHECK_CRON_FILE" && return 0
     local -a times=(); mapfile -t times < <(_skynet_censorcheck_times)
     [[ ${#times[@]} -gt 0 ]] || return 0
     _skynet_censorcheck_write_cron "${times[@]}"
