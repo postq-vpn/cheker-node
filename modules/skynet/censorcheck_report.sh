@@ -740,7 +740,8 @@ _skynet_censorcheck_run_and_report() {
 
     # Серверы, которые не удалось проверить из-за RIPE Atlas (не считая тех, где
     # просто не слушает 443): при них нельзя писать в заголовке "всё чисто".
-    local unverified_n=0 raw_head
+    # Флот и инфра считаются раздельно: у каждой группы свой вердикт.
+    local unverified_n=0 infra_unverified_n=0 raw_head
 
     # Серверы, не прошедшие проверку, и что ответили их зонды - для лога.
     # Строки SERVER/PROBE через таб; пишутся после загрузки имён операторов.
@@ -778,7 +779,11 @@ _skynet_censorcheck_run_and_report() {
 
         raw_head=$(head -1 "${tmp_dir}/${idx}.out" 2>/dev/null)
         if [[ "$raw_head" == ERROR* ]]; then
-            unverified_n=$((unverified_n + 1))
+            if [[ "$category" == "infra" ]]; then
+                infra_unverified_n=$((infra_unverified_n + 1))
+            else
+                unverified_n=$((unverified_n + 1))
+            fi
             probe_log+="SERVER"$'\t'"${name}"$'\t'"${raw_head}"$'\n'
         fi
 
@@ -1003,29 +1008,74 @@ _skynet_censorcheck_run_and_report() {
     local measured=$(( ok_n + blocked_n ))
     local infra_measured=$(( infra_ok_n + infra_blocked_n ))
 
-    # Вердикт-эмодзи идёт первым символом заголовка — виден даже в превью
-    # пуша, без открытия Telegram. Блокировка инфры (control-plane, не
-    # VPN-нода) сразу красная, даже если по флоту почти всё чисто - там
-    # молчание значит панель/нода недоступна, а не просто урезанный канал.
-    local verdict_emoji verdict_text
-    if [[ "$measured" -eq 0 && "$infra_measured" -eq 0 ]]; then
-        verdict_emoji="⚪"
-        verdict_text="нет данных"
-    elif [[ "$blocked_n" -eq 0 && "$infra_blocked_n" -eq 0 && "$unverified_n" -gt 0 ]]; then
-        verdict_emoji="🟡"
-        verdict_text="блокировок не найдено, не проверено: ${unverified_n}"
-    elif [[ "$blocked_n" -eq 0 && "$infra_blocked_n" -eq 0 ]]; then
-        verdict_emoji="🟢"
-        verdict_text="всё чисто"
-    elif [[ "$infra_blocked_n" -gt 0 ]] || { [[ "$measured" -gt 0 ]] && (( blocked_n * 100 >= measured * ${TSPU_RED_BLOCKED_SHARE:-50} )); }; then
-        verdict_emoji="🔴"
-        verdict_text="серьёзные блокировки"
-    else
-        verdict_emoji="🟡"
-        verdict_text="есть блокировки"
+    # Флот и инфра оцениваются раздельно, каждый своей строкой под заголовком:
+    # блокировка панели не должна выдавать себя за блокировку VPN-нод, и
+    # наоборот. Уровни: 0 🟢, 1 ⚪ нет данных, 2 🟡, 3 🔴. Пустая группа
+    # (нет ни одного сервера этой категории) строки не получает вовсе.
+    local fleet_level="" fleet_line="" infra_level="" infra_line=""
+    local infra_n=$(( infra_ok_n + infra_blocked_n + infra_skip_n ))
+
+    if [[ "$total" -gt 0 ]]; then
+        if [[ "$measured" -eq 0 ]]; then
+            fleet_level=1; fleet_line="⚪ нет данных"
+        elif [[ "$blocked_n" -eq 0 && "$unverified_n" -gt 0 ]]; then
+            fleet_level=2; fleet_line="🟡 блокировок не найдено, не проверено: ${unverified_n}"
+        elif [[ "$blocked_n" -eq 0 ]]; then
+            fleet_level=0; fleet_line="🟢 всё чисто"
+        elif (( blocked_n * 100 >= measured * ${TSPU_RED_BLOCKED_SHARE:-50} )); then
+            fleet_level=3; fleet_line="🔴 серьёзные блокировки (${blocked_n} из ${measured})"
+        else
+            fleet_level=2; fleet_line="🟡 есть блокировки (${blocked_n} из ${measured})"
+        fi
     fi
 
-    local report="${verdict_emoji} <b>Блокировка ТСПУ — ${verdict_text}</b>"$'\n\n'"<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
+    # Красный порог инфры свой (TSPU_INFRA_RED_BLOCKED_SHARE), по умолчанию 1% —
+    # то есть любой недоступный сервер: у панели или control-plane молчание
+    # значит, что она недоступна, а не просто урезанный канал.
+    if [[ "$infra_n" -gt 0 ]]; then
+        if [[ "$infra_measured" -eq 0 ]]; then
+            infra_level=1; infra_line="⚪ нет данных"
+        elif [[ "$infra_blocked_n" -gt 0 ]] \
+            && (( infra_blocked_n * 100 >= infra_measured * ${TSPU_INFRA_RED_BLOCKED_SHARE:-1} )); then
+            infra_level=3; infra_line="🔴 недоступно ${infra_blocked_n} из ${infra_measured}"
+        elif [[ "$infra_blocked_n" -gt 0 ]]; then
+            infra_level=2; infra_line="🟡 недоступно ${infra_blocked_n} из ${infra_measured}"
+        elif [[ "$infra_unverified_n" -gt 0 ]]; then
+            infra_level=2; infra_line="🟡 доступна, не проверено: ${infra_unverified_n}"
+        else
+            infra_level=0; infra_line="🟢 доступна"
+        fi
+    fi
+
+    # Вердикт-эмодзи идёт первым символом заголовка — виден даже в превью
+    # пуша, без открытия Telegram, — поэтому берётся по худшей из групп.
+    # «Нет данных» в заголовке только когда данных нет ни по одной группе;
+    # если другая группа померилась, это «не всё проверено» (🟡).
+    local verdict_emoji verdict_text worst=-1 lvl
+    local has_data=0 has_blocked=0
+    for lvl in $fleet_level $infra_level; do
+        (( lvl > worst )) && worst=$lvl
+        [[ "$lvl" -ne 1 ]] && has_data=1
+    done
+    (( blocked_n + infra_blocked_n > 0 )) && has_blocked=1
+
+    if [[ "$worst" -lt 0 || "$has_data" -eq 0 ]]; then
+        verdict_emoji="⚪"; verdict_text="нет данных"
+    elif [[ "$worst" -eq 0 ]]; then
+        verdict_emoji="🟢"; verdict_text="всё чисто"
+    elif [[ "$worst" -eq 3 ]]; then
+        verdict_emoji="🔴"; verdict_text="серьёзные блокировки"
+    elif [[ "$has_blocked" -eq 1 ]]; then
+        verdict_emoji="🟡"; verdict_text="есть блокировки"
+    else
+        verdict_emoji="🟡"; verdict_text="блокировок не найдено, не всё проверено"
+    fi
+
+    local report="${verdict_emoji} <b>Блокировка ТСПУ — ${verdict_text}</b>"$'\n\n'
+    [[ -n "$fleet_line" ]] && report+="🖥 Флот: ${fleet_line}"$'\n'
+    [[ -n "$infra_line" ]] && report+="🧩 Инфра: ${infra_line}"$'\n'
+    [[ -n "$fleet_line$infra_line" ]] && report+=$'\n'
+    report+="<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
 
     # Сводка поднята сразу под заголовок и в НЕразворачиваемой цитате -
     # главное видно без единого клика, детали (кто именно и где) остаются
@@ -1688,28 +1738,78 @@ _skynet_censorcheck_set_threshold() {
     sleep 1
 }
 
-_skynet_censorcheck_thresholds_menu() {
+# Сброс группы порогов: аргументы вида КЛЮЧ=значение.
+_skynet_censorcheck_reset_thresholds() {
+    local k v
+    for k in "$@"; do
+        v="${k#*=}"; k="${k%%=*}"
+        set_config_var "$k" "$v" && printf -v "$k" '%s' "$v"
+    done
+    printf_ok "Пороги сброшены к умолчаниям."
+    sleep 1
+}
+
+_skynet_censorcheck_fleet_thresholds_menu() {
     while true; do
         clear
-        menu_header "⚖ Пороги оценки блокировок"
-        printf_description "Сервер флота заблокирован уже при одном подтверждённом промахе"
-        printf_description "зонда (промахнулся дважды и дотянулся до контроля) — это не"
-        printf_description "порог, а правило. Ниже — то, что настраивается."
+        menu_header "🖥 Пороги оценки: флот"
+        printf_description "VPN-ноды флота. Сервер заблокирован уже при одном подтверждённом"
+        printf_description "промахе зонда (промахнулся дважды и дотянулся до контроля) — это"
+        printf_description "правило, а не порог. Ниже — то, что настраивается."
         echo ""
 
-        local infra="${TSPU_INFRA_OK_THRESHOLD:-60}" red="${TSPU_RED_BLOCKED_SHARE:-50}"
+        local red="${TSPU_RED_BLOCKED_SHARE:-50}"
         local share="${TSPU_REPLACE_CITY_SHARE:-50}" avg="${TSPU_REPLACE_AVG_THRESHOLD:-55}"
 
-        printf_menu_option "1" "Инфра-сервер доступен от ${C_GREEN}${infra}%${C_RESET} дошедших зондов"
-        printf_menu_option "2" "🔴 «Серьёзные блокировки» от ${C_GREEN}${red}%${C_RESET} заблокированных серверов флота"
-        printf_menu_option "3" "«Под замену»: блокировка минимум в ${C_GREEN}${share}%${C_RESET} городов"
-        printf_menu_option "4" "«Под замену»: средняя доступность по ним ниже ${C_GREEN}${avg}%${C_RESET}"
+        printf_menu_option "1" "🔴 «Серьёзные блокировки» от ${C_GREEN}${red}%${C_RESET} заблокированных серверов"
+        printf_menu_option "2" "«Под замену»: блокировка минимум в ${C_GREEN}${share}%${C_RESET} городов"
+        printf_menu_option "3" "«Под замену»: средняя доступность по ним ниже ${C_GREEN}${avg}%${C_RESET}"
         echo ""
-        printf_description "Вердикт отчёта: ⚪ нет данных · 🟢 всё чисто · 🟡 есть блокировки"
-        printf_description "(меньше порога [2]) · 🔴 порог [2] достигнут или заблокирована инфра."
-        printf_description "В «Под замену» сервер попадает, только если выполнены [3] и [4] сразу."
+        printf_description "Строка «Флот» в отчёте: ⚪ нет данных · 🟢 всё чисто ·"
+        printf_description "🟡 есть блокировки (меньше порога [1]) · 🔴 порог [1] достигнут."
+        printf_description "В «Под замену» сервер попадает, только если выполнены [2] и [3] сразу."
         echo ""
-        printf_menu_option "d" "Сбросить все пороги к умолчаниям (60 / 50 / 50 / 55)"
+        printf_menu_option "d" "Сбросить пороги флота к умолчаниям (50 / 50 / 55)"
+        printf_menu_option "b" "Назад"
+        echo ""
+
+        local choice; choice=$(safe_read "Выбор: " "") || { _LAST_CTRLC_SIGNALED=0; continue; }
+        case "$choice" in
+            1) _skynet_censorcheck_set_threshold TSPU_RED_BLOCKED_SHARE \
+                   "Флот красный, если заблокировано не меньше N% измеренных серверов." 50 ;;
+            2) _skynet_censorcheck_set_threshold TSPU_REPLACE_CITY_SHARE \
+                   "«Под замену»: сервер заблокирован минимум в N% городов выборки." 50 ;;
+            3) _skynet_censorcheck_set_threshold TSPU_REPLACE_AVG_THRESHOLD \
+                   "«Под замену»: средняя доступность по заблокированным городам ниже N%." 55 ;;
+            [dD]) _skynet_censorcheck_reset_thresholds TSPU_RED_BLOCKED_SHARE=50 \
+                      TSPU_REPLACE_CITY_SHARE=50 TSPU_REPLACE_AVG_THRESHOLD=55 ;;
+            [bB]) break ;;
+            *) printf_error "Неверный выбор."; sleep 1 ;;
+        esac
+    done
+}
+
+_skynet_censorcheck_infra_thresholds_menu() {
+    while true; do
+        clear
+        menu_header "🧩 Пороги оценки: инфра"
+        printf_description "Панели и control-plane (категория «инфра»). Оцениваются грубо:"
+        printf_description "доступен или нет, без процентов и городов, и в доступность"
+        printf_description "флота не входят."
+        echo ""
+
+        local ok="${TSPU_INFRA_OK_THRESHOLD:-60}" red="${TSPU_INFRA_RED_BLOCKED_SHARE:-1}"
+        local red_hint="от ${C_GREEN}${red}%${C_RESET} недоступных серверов"
+        [[ "$red" -eq 1 ]] && red_hint="при ${C_GREEN}любом${C_RESET} недоступном сервере (1%)"
+
+        printf_menu_option "1" "Сервер доступен от ${C_GREEN}${ok}%${C_RESET} дошедших зондов"
+        printf_menu_option "2" "🔴 Инфра красная ${red_hint}"
+        echo ""
+        printf_description "Строка «Инфра» в отчёте: ⚪ нет данных · 🟢 доступна ·"
+        printf_description "🟡 недоступна часть (меньше порога [2]) или не всё проверено ·"
+        printf_description "🔴 порог [2] достигнут."
+        echo ""
+        printf_menu_option "d" "Сбросить пороги инфры к умолчаниям (60 / 1)"
         printf_menu_option "b" "Назад"
         echo ""
 
@@ -1717,22 +1817,10 @@ _skynet_censorcheck_thresholds_menu() {
         case "$choice" in
             1) _skynet_censorcheck_set_threshold TSPU_INFRA_OK_THRESHOLD \
                    "Инфра-сервер считается доступным, если до него дошло не меньше N% зондов." 60 ;;
-            2) _skynet_censorcheck_set_threshold TSPU_RED_BLOCKED_SHARE \
-                   "Красный вердикт, если заблокировано не меньше N% измеренных серверов флота." 50 ;;
-            3) _skynet_censorcheck_set_threshold TSPU_REPLACE_CITY_SHARE \
-                   "«Под замену»: сервер заблокирован минимум в N% городов выборки." 50 ;;
-            4) _skynet_censorcheck_set_threshold TSPU_REPLACE_AVG_THRESHOLD \
-                   "«Под замену»: средняя доступность по заблокированным городам ниже N%." 55 ;;
-            [dD])
-                local k v
-                for k in TSPU_INFRA_OK_THRESHOLD=60 TSPU_RED_BLOCKED_SHARE=50 \
-                         TSPU_REPLACE_CITY_SHARE=50 TSPU_REPLACE_AVG_THRESHOLD=55; do
-                    v="${k#*=}"; k="${k%%=*}"
-                    set_config_var "$k" "$v" && printf -v "$k" '%s' "$v"
-                done
-                printf_ok "Пороги сброшены к умолчаниям."
-                sleep 1
-                ;;
+            2) _skynet_censorcheck_set_threshold TSPU_INFRA_RED_BLOCKED_SHARE \
+                   "Инфра красная, если недоступно не меньше N% измеренных серверов (1 — любой)." 1 ;;
+            [dD]) _skynet_censorcheck_reset_thresholds TSPU_INFRA_OK_THRESHOLD=60 \
+                      TSPU_INFRA_RED_BLOCKED_SHARE=1 ;;
             [bB]) break ;;
             *) printf_error "Неверный выбор."; sleep 1 ;;
         esac
@@ -1825,7 +1913,8 @@ _skynet_censorcheck_menu() {
         printf_description "Режим проверки:    ${mode_status}"
         printf_description "Серверы в проверке: ${servers_status}"
         printf_description "Расписание:        ${cron_status}"
-        printf_description "Пороги оценки:     инфра ${TSPU_INFRA_OK_THRESHOLD:-60}% · 🔴 от ${TSPU_RED_BLOCKED_SHARE:-50}% · замена ${TSPU_REPLACE_CITY_SHARE:-50}%/${TSPU_REPLACE_AVG_THRESHOLD:-55}%"
+        printf_description "Пороги флота:      🔴 от ${TSPU_RED_BLOCKED_SHARE:-50}% · замена ${TSPU_REPLACE_CITY_SHARE:-50}%/${TSPU_REPLACE_AVG_THRESHOLD:-55}%"
+        printf_description "Пороги инфры:      доступна от ${TSPU_INFRA_OK_THRESHOLD:-60}% зондов · 🔴 от ${TSPU_INFRA_RED_BLOCKED_SHARE:-1}%"
         echo ""
 
         printf_menu_option "n" "Настроить TG_BOT_TOKEN / TG_CHAT_ID"
@@ -1833,7 +1922,8 @@ _skynet_censorcheck_menu() {
         printf_menu_option "g" "Режим проверки, выборка зондов и цена прогона"
         printf_menu_option "s" "Серверы в проверке (включить/исключить)"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
-        printf_menu_option "t" "Пороги оценки блокировок"
+        printf_menu_option "t" "Пороги оценки: флот"
+        printf_menu_option "y" "Пороги оценки: инфра"
         printf_menu_option "r" "Запустить проверку и отчёт СЕЙЧАС"
         printf_menu_option "i" "Проверка IP"
         echo ""
@@ -1847,7 +1937,8 @@ _skynet_censorcheck_menu() {
             [gG]) _skynet_censorcheck_probe_set_menu ;;
             [sS]) _skynet_censorcheck_servers_menu ;;
             [eE]) _skynet_censorcheck_schedule_menu ;;
-            [tT]) _skynet_censorcheck_thresholds_menu ;;
+            [tT]) _skynet_censorcheck_fleet_thresholds_menu ;;
+            [yY]) _skynet_censorcheck_infra_thresholds_menu ;;
             [iI]) _skynet_censorcheck_check_address ;;
             [rR])
                 if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]]; then
