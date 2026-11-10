@@ -517,9 +517,10 @@ _skynet_tspu_summarize_server() {
 
     # Инфра-серверы (control-plane, панели и т.п., не VPN-ноды) не нужно
     # показывать с точностью до процента и городов - только грубый вердикт
-    # по порогу: доступен, если пробилось хотя бы 60% зондов, иначе нет.
+    # по порогу: доступен, если пробилось хотя бы TSPU_INFRA_OK_THRESHOLD%
+    # зондов (по умолчанию 60), иначе нет.
     if [[ "$category" == "infra" ]]; then
-        if [[ "$percent" -ge 60 ]]; then
+        if [[ "$percent" -ge "${TSPU_INFRA_OK_THRESHOLD:-60}" ]]; then
             echo "AVAILABLE"
         else
             echo "BLOCKED недоступен"
@@ -1016,7 +1017,7 @@ _skynet_censorcheck_run_and_report() {
     elif [[ "$blocked_n" -eq 0 && "$infra_blocked_n" -eq 0 ]]; then
         verdict_emoji="🟢"
         verdict_text="всё чисто"
-    elif [[ "$infra_blocked_n" -gt 0 ]] || { [[ "$measured" -gt 0 ]] && (( blocked_n * 2 >= measured )); }; then
+    elif [[ "$infra_blocked_n" -gt 0 ]] || { [[ "$measured" -gt 0 ]] && (( blocked_n * 100 >= measured * ${TSPU_RED_BLOCKED_SHARE:-50} )); }; then
         verdict_emoji="🔴"
         verdict_text="серьёзные блокировки"
     else
@@ -1032,7 +1033,7 @@ _skynet_censorcheck_run_and_report() {
     local summary_block="📊 <b>Сводка</b>"$'\n'
     if [[ "$fleet_total" -gt 0 ]]; then
         # "Без учёта инфры" явно проговариваем: зонды инфра-серверов сюда не
-        # входят (у инфры отдельный вердикт по 60%-порогу, а не по зондам).
+        # входят (у инфры отдельный вердикт по порогу TSPU_INFRA_OK_THRESHOLD).
         summary_block+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
         summary_block+="• Серверов с блокировками: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
         if [[ "$city_n" -gt 0 ]]; then
@@ -1662,6 +1663,82 @@ _skynet_censorcheck_servers_menu() {
     done
 }
 
+# Пороги оценки блокировок. Меняют только то, как готовые результаты зондов
+# раскладываются по вердиктам - выборку зондов и цену прогона не трогают.
+# Значения пишутся в настройки (set_config_var) и сразу же в переменную
+# текущей сессии, чтобы [r] «Запустить сейчас» шёл уже по новым порогам.
+_skynet_censorcheck_set_threshold() {
+    local key="$1" label="$2" default="$3"
+    local current="${!key:-$default}" value
+    echo ""
+    printf_description "${label}"
+    printf_description "Сейчас: ${C_GREEN}${current}%${C_RESET}, по умолчанию ${default}%. Целое число 1-100, «-» — сбросить."
+    value=$(safe_read "Новое значение" "$current") || { _LAST_CTRLC_SIGNALED=0; return; }
+    value="${value//[[:space:]%]/}"
+    [[ "$value" == "-" ]] && value="$default"
+    if [[ ! "$value" =~ ^[0-9]+$ ]] || (( 10#$value < 1 || 10#$value > 100 )); then
+        printf_error "Нужно целое число от 1 до 100."
+        sleep 1
+        return
+    fi
+    value=$((10#$value))
+    set_config_var "$key" "$value" || { printf_error "Не удалось сохранить настройку."; sleep 1; return; }
+    printf -v "$key" '%s' "$value"
+    printf_ok "Сохранено: ${value}%."
+    sleep 1
+}
+
+_skynet_censorcheck_thresholds_menu() {
+    while true; do
+        clear
+        menu_header "⚖ Пороги оценки блокировок"
+        printf_description "Сервер флота заблокирован уже при одном подтверждённом промахе"
+        printf_description "зонда (промахнулся дважды и дотянулся до контроля) — это не"
+        printf_description "порог, а правило. Ниже — то, что настраивается."
+        echo ""
+
+        local infra="${TSPU_INFRA_OK_THRESHOLD:-60}" red="${TSPU_RED_BLOCKED_SHARE:-50}"
+        local share="${TSPU_REPLACE_CITY_SHARE:-50}" avg="${TSPU_REPLACE_AVG_THRESHOLD:-55}"
+
+        printf_menu_option "1" "Инфра-сервер доступен от ${C_GREEN}${infra}%${C_RESET} дошедших зондов"
+        printf_menu_option "2" "🔴 «Серьёзные блокировки» от ${C_GREEN}${red}%${C_RESET} заблокированных серверов флота"
+        printf_menu_option "3" "«Под замену»: блокировка минимум в ${C_GREEN}${share}%${C_RESET} городов"
+        printf_menu_option "4" "«Под замену»: средняя доступность по ним ниже ${C_GREEN}${avg}%${C_RESET}"
+        echo ""
+        printf_description "Вердикт отчёта: ⚪ нет данных · 🟢 всё чисто · 🟡 есть блокировки"
+        printf_description "(меньше порога [2]) · 🔴 порог [2] достигнут или заблокирована инфра."
+        printf_description "В «Под замену» сервер попадает, только если выполнены [3] и [4] сразу."
+        echo ""
+        printf_menu_option "d" "Сбросить все пороги к умолчаниям (60 / 50 / 50 / 55)"
+        printf_menu_option "b" "Назад"
+        echo ""
+
+        local choice; choice=$(safe_read "Выбор: " "") || { _LAST_CTRLC_SIGNALED=0; continue; }
+        case "$choice" in
+            1) _skynet_censorcheck_set_threshold TSPU_INFRA_OK_THRESHOLD \
+                   "Инфра-сервер считается доступным, если до него дошло не меньше N% зондов." 60 ;;
+            2) _skynet_censorcheck_set_threshold TSPU_RED_BLOCKED_SHARE \
+                   "Красный вердикт, если заблокировано не меньше N% измеренных серверов флота." 50 ;;
+            3) _skynet_censorcheck_set_threshold TSPU_REPLACE_CITY_SHARE \
+                   "«Под замену»: сервер заблокирован минимум в N% городов выборки." 50 ;;
+            4) _skynet_censorcheck_set_threshold TSPU_REPLACE_AVG_THRESHOLD \
+                   "«Под замену»: средняя доступность по заблокированным городам ниже N%." 55 ;;
+            [dD])
+                local k v
+                for k in TSPU_INFRA_OK_THRESHOLD=60 TSPU_RED_BLOCKED_SHARE=50 \
+                         TSPU_REPLACE_CITY_SHARE=50 TSPU_REPLACE_AVG_THRESHOLD=55; do
+                    v="${k#*=}"; k="${k%%=*}"
+                    set_config_var "$k" "$v" && printf -v "$k" '%s' "$v"
+                done
+                printf_ok "Пороги сброшены к умолчаниям."
+                sleep 1
+                ;;
+            [bB]) break ;;
+            *) printf_error "Неверный выбор."; sleep 1 ;;
+        esac
+    done
+}
+
 _skynet_censorcheck_schedule_menu() {
     while true; do
         clear
@@ -1748,6 +1825,7 @@ _skynet_censorcheck_menu() {
         printf_description "Режим проверки:    ${mode_status}"
         printf_description "Серверы в проверке: ${servers_status}"
         printf_description "Расписание:        ${cron_status}"
+        printf_description "Пороги оценки:     инфра ${TSPU_INFRA_OK_THRESHOLD:-60}% · 🔴 от ${TSPU_RED_BLOCKED_SHARE:-50}% · замена ${TSPU_REPLACE_CITY_SHARE:-50}%/${TSPU_REPLACE_AVG_THRESHOLD:-55}%"
         echo ""
 
         printf_menu_option "n" "Настроить TG_BOT_TOKEN / TG_CHAT_ID"
@@ -1755,6 +1833,7 @@ _skynet_censorcheck_menu() {
         printf_menu_option "g" "Режим проверки, выборка зондов и цена прогона"
         printf_menu_option "s" "Серверы в проверке (включить/исключить)"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
+        printf_menu_option "t" "Пороги оценки блокировок"
         printf_menu_option "r" "Запустить проверку и отчёт СЕЙЧАС"
         printf_menu_option "i" "Проверка IP"
         echo ""
@@ -1768,6 +1847,7 @@ _skynet_censorcheck_menu() {
             [gG]) _skynet_censorcheck_probe_set_menu ;;
             [sS]) _skynet_censorcheck_servers_menu ;;
             [eE]) _skynet_censorcheck_schedule_menu ;;
+            [tT]) _skynet_censorcheck_thresholds_menu ;;
             [iI]) _skynet_censorcheck_check_address ;;
             [rR])
                 if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]]; then
