@@ -30,6 +30,7 @@
 #   fleet delete <N>                - stdin: {expectName}
 #   tspu status                     - настройки, расписание, идёт ли прогон
 #   tspu last                       - последний прогон целиком
+#   tspu credits                    - баланс кредитов RIPE Atlas
 #   tspu runs [лимит]               - история прогонов (сводки)
 #   tspu get <id>                   - прогон из истории целиком
 #   tspu run                        - запустить прогон флота в фоне
@@ -519,6 +520,43 @@ _api_tspu_status() {
           running: $running, last: $last, lastError: $lastError}')"
 }
 
+# Баланс кредитов RIPE Atlas. Читать его ключ может, только если ему выдано
+# право на кредиты (atlas.ripe.net → API Keys → «Get information about your
+# credits»): без него RIPE отвечает 403, и это отдельный ответ, а не ошибка,
+# - всё остальное в проверке ТСПУ работает и так.
+_api_tspu_credits() {
+    [[ -n "${RIPE_API_KEY:-}" ]] || { _api_err RIPE_NOT_CONFIGURED "RIPE Atlas API-ключ не настроен."; return; }
+    local body
+    body=$(RIPE_API_KEY="$RIPE_API_KEY" python3 - <<'PY' 2>/dev/null
+import json, os, urllib.error, urllib.request
+req = urllib.request.Request(
+    "https://atlas.ripe.net/api/v2/credits/",
+    headers={"Authorization": "Key " + os.environ["RIPE_API_KEY"], "Accept": "application/json"},
+)
+def num(value):
+    return value if isinstance(value, (int, float)) else None
+try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        d = json.load(resp)
+    print(json.dumps({
+        "available": True,
+        "balance": num(d.get("current_balance")),
+        "dailyIncome": num(d.get("estimated_daily_income")),
+        "dailyExpenditure": num(d.get("estimated_daily_expenditure")),
+        "pastDaySpent": num(d.get("past_day_credits_spent")),
+        "runoutSeconds": num(d.get("estimated_runout_seconds")),
+    }))
+except urllib.error.HTTPError as e:
+    reason = "NO_PERMISSION" if e.code in (401, 403) else f"HTTP_{e.code}"
+    print(json.dumps({"available": False, "reason": reason}))
+except Exception as e:
+    print(json.dumps({"available": False, "reason": "UNREACHABLE"}))
+PY
+)
+    [[ -n "$body" ]] || body='{"available":false,"reason":"UNREACHABLE"}'
+    _api_ok "$(jq -c --argjson per "$_CENSORCHECK_CREDITS_PER_PROBE" '{credits: .} | .creditsPerProbe = $per' <<< "$body")"
+}
+
 _api_tspu_last() {
     if [[ -s "${_TSPU_STORE_DIR}/last.json" ]]; then
         _api_ok "$(jq -c '{run: .}' < "${_TSPU_STORE_DIR}/last.json")"
@@ -749,6 +787,7 @@ _api_main() {
         "fleet delete")  _api_fleet_delete "$@" ;;
         "tspu status")   _api_tspu_status ;;
         "tspu last")     _api_tspu_last ;;
+        "tspu credits")  _api_tspu_credits ;;
         "tspu runs")     _api_tspu_runs "$@" ;;
         "tspu get")      _api_tspu_get "$@" ;;
         "tspu run")      _api_tspu_run ;;
