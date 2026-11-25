@@ -56,8 +56,7 @@ _skynet_valid_sni() {
 }
 
 _skynet_valid_server_sni() {
-    local category="$1" sni="$2"
-    [[ "$category" == infra && -z "$sni" ]] || _skynet_valid_sni "$sni"
+    [[ -z "$1" ]] || _skynet_valid_sni "$1"
 }
 
 _sanitize_fleet_database() {

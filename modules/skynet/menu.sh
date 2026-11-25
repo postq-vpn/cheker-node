@@ -46,19 +46,17 @@ _skynet_is_local_newer() {
 # ============================================================ #
 
 _skynet_read_sni() {
-    local category="$1" current="${2:-}" allow_legacy_empty="${3:-no}" value
-    local prompt="SNI сервера (домен)"
-    if [[ "$category" == infra ]]; then
-        if [[ -n "$current" ]]; then
-            prompt="SNI сервера (домен, минус для удаления)"
-        else
-            prompt="SNI сервера (необязательно, Enter для пропуска)"
-        fi
+    local category="$1" current="${2:-}" value
+    local prompt="SNI сервера (Enter — базовый ${TSPU_REALITY_SNI:-max.ru})"
+    if [[ -n "$current" ]]; then
+        prompt="SNI сервера (Enter — оставить, минус — очистить)"
+    elif [[ "$category" == infra ]]; then
+        prompt="SNI сервера (Enter — пропустить проверку)"
     fi
     while true; do
         value=$(safe_read "$prompt" "$current") || return 130
-        [[ "$category" == infra && "$value" == "-" ]] && value=""
-        if [[ -z "$value" && "$allow_legacy_empty" == yes ]] || _skynet_valid_server_sni "$category" "$value"; then
+        [[ "$value" == "-" ]] && value=""
+        if _skynet_valid_server_sni "$value"; then
             printf '%s' "$value"
             return
         fi
@@ -576,9 +574,7 @@ REMOTE_SCRIPT
             1) cat="fleet" ;;
             2) cat="infra" ;;
         esac
-        local allow_legacy_empty=no
-        [[ "$cat" == "$s_category" && -z "$s_sni" ]] && allow_legacy_empty=yes
-        local new_sni; new_sni=$(_skynet_read_sni "$cat" "$s_sni" "$allow_legacy_empty") || return
+        local new_sni; new_sni=$(_skynet_read_sni "$cat" "$s_sni") || return
         server_data="${n}|${u}|${i}|${p}|${k}|${pw}|${cat}|${new_sni}"; _update_fleet_record "$server_idx" "$server_data"; s_name=$n; s_user=$u; s_ip=$i; s_port=$p; s_key=$k; s_pass=$pw; s_category=$cat; s_sni=$new_sni; ok "Запись обновлена."; wait_for_enter
     }
     _sm_delete() { 

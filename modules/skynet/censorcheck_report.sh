@@ -209,11 +209,12 @@ _skynet_tspu_excluded_count() {
 }
 
 _skynet_tspu_target_count() {
-    local excluded name sni count=0
+    local excluded name category sni count=0
     excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
     if [[ -s "$FLEET_DATABASE_FILE" ]]; then
-        while IFS='|' read -r name _ _ _ _ _ _ sni; do
-            [[ -n "$name" && -n "$sni" ]] || continue
+        while IFS='|' read -r name _ _ _ _ _ category sni; do
+            [[ -n "$name" ]] || continue
+            [[ "$category" == infra && -z "$sni" ]] && continue
             _skynet_tspu_csv_contains "${name%$'\r'}" "$excluded" && continue
             count=$((count + 1))
         done < "$FLEET_DATABASE_FILE"
@@ -398,8 +399,8 @@ _skynet_censorcheck_configure_ripe() {
     fi
 
     echo ""
-    printf_description "SNI для ручной проверки IP. При проверке флота используется"
-    printf_description "SNI из карточки каждого сервера."
+    printf_description "Базовый SNI для ручной проверки IP и серверов флота,"
+    printf_description "у которых в карточке не указан свой SNI."
     local sni; sni=$(ask_non_empty "SNI для пробы" "${TSPU_REALITY_SNI:-max.ru}") || return
 
     set_env_var "RIPE_API_KEY" "$key"
@@ -645,7 +646,9 @@ _skynet_tspu_check_fleet_parallel() {
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
         echo "$category" > "${tmp_dir}/${i}.category"
-        if [[ -z "$sni" ]]; then
+        if [[ "$category" == fleet ]]; then
+            sni="${sni:-${TSPU_REALITY_SNI:-max.ru}}"
+        elif [[ -z "$sni" ]]; then
             echo NOSNI > "${tmp_dir}/${i}.out"
             continue
         fi
@@ -815,7 +818,7 @@ _skynet_censorcheck_run_and_report() {
     fi
 
     if [[ "$verbose" -eq 1 ]]; then
-        printf_info "Проверяю доступность серверов флота с указанным SNI из сетей РФ (RIPE Atlas, параллельно)."
+        printf_info "Проверяю доступность серверов флота из сетей РФ (RIPE Atlas, параллельно)."
         printf_info "Выборка: ${sample_line}, по одному замеру на сервер."
         printf_info "Промахи перепроверяются отдельно — это займёт пару минут."
 
@@ -1783,7 +1786,7 @@ _skynet_censorcheck_servers_menu() {
             local status status_color
             if _skynet_tspu_csv_contains "$name" "$excluded"; then
                 status="ИСКЛЮЧЁН"; status_color="${C_RED}"
-            elif [[ -z "$sni" ]]; then
+            elif [[ "$category" == infra && -z "$sni" ]]; then
                 status="БЕЗ SNI"; status_color="${C_YELLOW}"
             else
                 status="ПРОВЕРЯЕТСЯ"; status_color="${C_GREEN}"
@@ -2017,7 +2020,7 @@ _skynet_censorcheck_menu() {
         local mode_status="${C_GREEN}по географии${C_RESET} (города и операторы)"
         [[ "${TSPU_CHECK_MODE:-geo}" == "common" ]] && mode_status="${C_GREEN}общая${C_RESET} (без разбивки по городам)"
 
-        local servers_status="со своим SNI: $(_skynet_tspu_target_count)"
+        local servers_status="$(_skynet_tspu_target_count)"
         local excluded_n_status; excluded_n_status=$(_skynet_tspu_excluded_count)
         [[ "$excluded_n_status" -gt 0 ]] && servers_status+=", ${C_YELLOW}исключено ${excluded_n_status}${C_RESET}"
 
