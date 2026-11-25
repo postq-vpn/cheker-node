@@ -25,7 +25,7 @@
 #   fleet list                      - серверы флота
 #   fleet ping                      - доступность SSH-порта и 443 у каждого
 #   fleet hostkey <хост> [порт]     - отпечатки ключа хоста до добавления
-#   fleet add                       - stdin: {name,host,user,port,category,password,acceptFingerprints}
+#   fleet add                       - stdin: {name,host,user,port,category,password,acceptFingerprints,privateKey}
 #   fleet update <N>                - stdin: {expectName, ...поля как у add}
 #   fleet delete <N>                - stdin: {expectName}
 #   tspu status                     - настройки, расписание, идёт ли прогон
@@ -243,7 +243,7 @@ _api_fleet_hostkey() {
 #   accept_json - массив отпечатков, которые человек видел и подтвердил;
 #   password    - для однократного заброса ключа, если входа по ключу нет.
 _api_ensure_access() {
-    local host="$1" port="$2" user="$3" password="$4" accept_json="$5"
+    local host="$1" port="$2" user="$3" password="$4" accept_json="$5" key_override="${6:-}"
 
     local raw; raw=$(mktemp)
     local scan
@@ -281,7 +281,8 @@ _api_ensure_access() {
     esac
     rm -f "$raw"
 
-    local key; key=$(_ensure_master_key 2>/dev/null)
+    local key="$key_override"
+    [[ -n "$key" ]] || key=$(_ensure_master_key 2>/dev/null)
     [[ -f "$key" ]] || { _api_err KEY_MISSING "Не удалось создать мастер-ключ."; return 1; }
 
     local -a ssh_opts=(-q -F /dev/null -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5
@@ -292,7 +293,11 @@ _api_ensure_access() {
     fi
 
     if [[ -z "$password" ]]; then
-        _api_err NEED_PASSWORD "Вход по мастер-ключу не прошёл. Укажи пароль — ключ будет закинут на сервер один раз."
+        if [[ -n "$key_override" ]]; then
+            _api_err NEED_PASSWORD "Вход по этому ключу не прошёл. Укажи пароль — его публичная часть будет закинута на сервер один раз."
+        else
+            _api_err NEED_PASSWORD "Вход по мастер-ключу не прошёл. Укажи пароль — ключ будет закинут на сервер один раз."
+        fi
         return 1
     fi
 
@@ -315,8 +320,63 @@ _api_ensure_access() {
         _api_err KEY_DEPLOY_FAILED "Ключ закинут, но вход по нему не прошёл."
         return 1
     fi
-    log "Skynet API: мастер-ключ закинут на ${user}@${host}:${port}."
+    log "Skynet API: ключ $(basename "$key") закинут на ${user}@${host}:${port}."
     echo "$key"
+}
+
+# Свой ключ сервера из входа (privateKey) - как импорт в меню Решалы
+# (_import_ssh_key): ~/.ssh/reshala_imported_<имя>, публичная часть рядом.
+# Печатает путь к ключу. Код возврата - что произошло, потому что вызов идёт
+# через $(...), и переменные отсюда до вызывающего не доходят:
+#   0 - такой ключ уже был импортирован (под любым именем), он и берётся;
+#   3 - ключ записан заново: при неудаче вызывающий удаляет его сам;
+#   1 - ключа во входе нет;   2 - ключ негодный (ошибка уже напечатана).
+_api_import_key() {
+    local server_name="$1"
+    local material; material=$(jq -r '.privateKey // ""' <<< "$_API_INPUT")
+    material="${material//$'\r'/}"
+    [[ -n "$material" ]] || return 1
+    (( ${#material} <= 16384 )) || { _api_err BAD_KEY "Ключ слишком большой."; return 2; }
+    [[ "$material" == *"PRIVATE KEY"* ]] || { _api_err BAD_KEY "Это не приватный ключ: нужен файл целиком, со строками BEGIN/END."; return 2; }
+
+    local tmp; tmp=$(mktemp) || { _api_err INTERNAL "mktemp"; return 2; }
+    chmod 600 "$tmp"
+    printf '%s\n' "$material" > "$tmp"
+    local pub
+    # -P "" - без вопроса о парольной фразе: защищённый ею ключ здесь
+    # просто не открывается, а не повисает в ожидании ввода.
+    if ! pub=$(ssh-keygen -y -P "" -f "$tmp" 2>/dev/null); then
+        rm -f "$tmp"
+        _api_err BAD_KEY "Ключ не читается: неверный формат или он защищён парольной фразой (такие не поддерживаются)."
+        return 2
+    fi
+    pub=$(awk '{print $1" "$2}' <<< "$pub")
+
+    mkdir -p "${HOME}/.ssh"; chmod 700 "${HOME}/.ssh"
+    # Тот же ключ уже лежит (импортирован раньше, хоть под другим именем) -
+    # второй копии не заводим.
+    local existing
+    for existing in "${HOME}"/.ssh/reshala_imported_*; do
+        [[ -f "$existing" && "$existing" != *.pub ]] || continue
+        if [[ "$(ssh-keygen -y -P "" -f "$existing" 2>/dev/null | awk '{print $1" "$2}')" == "$pub" ]]; then
+            rm -f "$tmp"
+            echo "$existing"
+            return 0
+        fi
+    done
+
+    local slug; slug=$(printf '%s' "$server_name" | tr -cd '[:alnum:]_-' | head -c 40)
+    [[ -n "$slug" ]] || slug="key"
+    local path="${HOME}/.ssh/reshala_imported_${slug}" n=2
+    while [[ -e "$path" ]]; do
+        path="${HOME}/.ssh/reshala_imported_${slug}-${n}"; n=$((n + 1))
+    done
+    mv "$tmp" "$path"
+    chmod 600 "$path"
+    printf '%s %s\n' "$pub" "reshala-imported" > "${path}.pub"
+    chmod 644 "${path}.pub"
+    echo "$path"
+    return 3
 }
 
 # Общая проверка полей add/update. Печатает ошибку и возвращает 1.
@@ -358,8 +418,18 @@ _api_fleet_add() {
     [[ "$password" != *"|"* && "$password" != *$'\n'* ]] || { _api_err BAD_PASSWORD "Пароль не может содержать «|» и перевод строки."; return; }
     _api_name_taken "$name" && { _api_err NAME_TAKEN "Сервер «${name}» уже есть во флоте."; return; }
 
+    local own_key="" rc=0
+    own_key=$(_api_import_key "$name") || rc=$?
+    [[ "$rc" -eq 2 ]] && { echo "$own_key"; return; }
+    [[ "$rc" -eq 1 ]] && own_key=""
+
     local key
-    key=$(_api_ensure_access "$host" "$port" "$user" "$password" "$accept") || { echo "$key"; return; }
+    if ! key=$(_api_ensure_access "$host" "$port" "$user" "$password" "$accept" "$own_key"); then
+        # Ключ, записанный только что, без доступа никому не нужен.
+        [[ "$rc" -eq 3 ]] && rm -f "$own_key" "${own_key}.pub"
+        echo "$key"
+        return
+    fi
 
     echo "${name}|${user}|${host}|${port}|${key}|${password}|${category}" >> "$FLEET_DATABASE_FILE"
     chmod 600 "$FLEET_DATABASE_FILE" 2>/dev/null || true
@@ -393,10 +463,22 @@ _api_fleet_update() {
 
     # Сменился адрес, порт или пользователь - доступ проверяется заново, как
     # при добавлении. Иначе ключ остаётся прежним.
+    # Новый ключ - тоже повод проверить доступ заново (уже им).
+    local own_key="" rc=0
+    own_key=$(_api_import_key "$name") || rc=$?
+    [[ "$rc" -eq 2 ]] && { echo "$own_key"; return; }
+    [[ "$rc" -eq 1 ]] && own_key=""
+
     local key="$o_key"
-    if [[ "$host" != "$o_ip" || "$port" != "${o_port:-22}" || "$user" != "$o_user" ]]; then
+    if [[ -n "$own_key" || "$host" != "$o_ip" || "$port" != "${o_port:-22}" || "$user" != "$o_user" ]]; then
         local accept; accept=$(jq -c '.acceptFingerprints // []' <<< "$_API_INPUT")
-        key=$(_api_ensure_access "$host" "$port" "$user" "$password" "$accept") || { echo "$key"; return; }
+        # Без нового ключа - тот, что был у сервера (не обязательно мастер).
+        if ! key=$(_api_ensure_access "$host" "$port" "$user" "$password" "$accept" "${own_key:-$o_key}"); then
+            # Ключ, записанный только что, без доступа никому не нужен.
+        [[ "$rc" -eq 3 ]] && rm -f "$own_key" "${own_key}.pub"
+            echo "$key"
+            return
+        fi
     fi
 
     _update_fleet_record "$n" "${name}|${user}|${host}|${port}|${key}|${password}|${category}"
