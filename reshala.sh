@@ -320,7 +320,23 @@ main() {
     # Headless-запуск из cron: проверка "Блокировка ТСПУ" по всему флоту
     # с отчётом в Telegram, без выхода в интерактивное меню.
     if [[ "${1:-}" == "censorcheck-report" ]]; then
-        run_module skynet/censorcheck_report _skynet_censorcheck_run_and_report --cron
+        # --api: запуск из панели (reshala api tspu run) - Telegram необязателен.
+        local cc_mode="--cron"
+        [[ "${2:-}" == "--api" ]] && cc_mode="--api"
+        run_module skynet/censorcheck_report _skynet_censorcheck_run_locked "$cc_mode"
+        exit $?
+    fi
+
+    # JSON-интерфейс к флоту и проверке ТСПУ для графической панели
+    # (modules/skynet/api.sh). api-ssh - вход для ключа панели, ограниченного
+    # в authorized_keys: команду берёт из SSH_ORIGINAL_COMMAND.
+    if [[ "${1:-}" == "api" ]]; then
+        shift
+        run_module skynet/api _api_main "$@"
+        exit $?
+    fi
+    if [[ "${1:-}" == "api-ssh" ]]; then
+        run_module skynet/api _api_ssh_entry
         exit $?
     fi
 

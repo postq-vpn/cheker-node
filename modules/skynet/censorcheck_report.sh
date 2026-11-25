@@ -36,6 +36,19 @@ _TSPU_PROBE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_probe.py"
 # уже здесь сохранено, без нового замера.
 _TSPU_INFRA_STATE_FILE="/etc/reshala/tspu_infra.state"
 
+# Результаты проверок в JSON для `reshala api` (графический интерфейс в
+# панели): <dir>/last.json, <dir>/runs/<id>.json - история прогонов,
+# <dir>/checks/<id>.json - разовые проверки адреса. Telegram-отчёт этого не
+# заменяет и от этого не зависит.
+_TSPU_STORE_DIR="/etc/reshala/tspu"
+_TSPU_STORE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_store.py"
+
+# Один прогон флота за раз: cron, меню и `reshala api tspu run` берут один и
+# тот же замок. Два прогона подряд - это двойная цена в кредитах RIPE Atlas
+# и два одинаковых отчёта. В running.json - кто и когда держит замок.
+_TSPU_LOCK_FILE="/run/reshala-tspu.lock"
+_TSPU_RUNNING_FILE="${_TSPU_STORE_DIR}/running.json"
+
 # Сколько проверок в день считаем нормой. Дальше добавлять можно, но со
 # спросом: каждый прогон создаёт измерение RIPE Atlas на КАЖДЫЙ сервер флота
 # (кредиты не бесконечные, см. _skynet_censorcheck_probe_set_menu) и
@@ -640,22 +653,92 @@ _skynet_tspu_check_fleet_parallel() {
 #                     ЗАПУСК ПРОВЕРКИ И ОТЧЁТ                  #
 # ============================================================ #
 
-# _skynet_censorcheck_run_and_report [--cron]
+# Имена операторов для JSON: держатели ASN из кэша RIPEstat, поверх них -
+# свои русские названия Решалы (_TSPU_ASN_NAMES), как в отчёте.
+_skynet_tspu_asn_names_file() {
+    local out="$1" asn
+    _skynet_tspu_py asnnames > "$out" 2>/dev/null || : > "$out"
+    for asn in "${!_TSPU_ASN_NAMES[@]}"; do
+        printf '%s\t%s\n' "$asn" "${_TSPU_ASN_NAMES[$asn]}" >> "$out"
+    done
+}
+
+# Сохраняет прогон флота в JSON (см. tspu_store.py). Сбой здесь не должен
+# мешать отчёту в Telegram - только пишется в лог.
+_skynet_tspu_store_run() {
+    local tmp_dir="$1" probes_out="$2" started="$3" source="$4" sni="$5"
+    [[ -f "$_TSPU_STORE_SCRIPT" ]] || return 0
+    mkdir -p "$_TSPU_STORE_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$probes_out" > "${tmp_dir}/.probes"
+    _skynet_tspu_asn_names_file "${tmp_dir}/.asnnames"
+    local run_id
+    if run_id=$(python3 "$_TSPU_STORE_SCRIPT" run "$tmp_dir" "$_TSPU_STORE_DIR" \
+            "${tmp_dir}/.probes" "${tmp_dir}/.asnnames" "$started" "$source" "$sni" 2>&1); then
+        log "CensorCheck: результат сохранён (${run_id})."
+    else
+        log "CensorCheck: не удалось сохранить результат в JSON: ${run_id}"
+    fi
+}
+
+# Прогон под замком (см. _TSPU_LOCK_FILE): cron, меню и панель. Занято -
+# код 75 (EX_TEMPFAIL), второй прогон не стартует.
+_skynet_censorcheck_run_locked() {
+    local mode="${1:-}" lock_fd rc
+    mkdir -p "$_TSPU_STORE_DIR" 2>/dev/null || true
+    exec {lock_fd}>"$_TSPU_LOCK_FILE" || return 1
+    if ! flock -n "$lock_fd"; then
+        exec {lock_fd}>&-
+        [[ -z "$mode" ]] && printf_warning "Проверка уже идёт — дождись её окончания."
+        log "CensorCheck: проверка уже идёт, повторный запуск (${mode:-menu}) пропущен."
+        return 75
+    fi
+    local source="menu"
+    [[ "$mode" == "--cron" ]] && source="cron"
+    [[ "$mode" == "--api" ]] && source="panel"
+    printf '{"startedAt":"%s","source":"%s","pid":%d}\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')" "$source" "$$" > "$_TSPU_RUNNING_FILE" 2>/dev/null || true
+    _skynet_censorcheck_run_and_report "$mode"
+    rc=$?
+    rm -f "$_TSPU_RUNNING_FILE" 2>/dev/null || true
+    # Почему прогон не дошёл до конца - для панели: сам прогон пишет причину
+    # только в лог, а результат при этом не сохраняется вовсе.
+    if [[ "$rc" -ne 0 ]]; then
+        local reason; reason=$(grep 'CensorCheck:' "$LOGFILE" 2>/dev/null | tail -n1 | sed 's/^\[[^]]*\] - CensorCheck: //')
+        python3 -c 'import json,sys; print(json.dumps({"at":sys.argv[1],"source":sys.argv[2],"code":int(sys.argv[3]),"message":sys.argv[4]},ensure_ascii=False))' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')" "$source" "$rc" "$reason" > "${_TSPU_STORE_DIR}/last_error.json" 2>/dev/null || true
+    else
+        rm -f "${_TSPU_STORE_DIR}/last_error.json" 2>/dev/null || true
+    fi
+    exec {lock_fd}>&-
+    return "$rc"
+}
+
+# _skynet_censorcheck_run_and_report [--cron|--api]
 # --cron подавляет интерактивный вывод (для запуска без TTY).
+# --api - то же, плюс Telegram необязателен (запуск из панели).
+# Снаружи вызывать через _skynet_censorcheck_run_locked.
 _skynet_censorcheck_run_and_report() {
     local mode="${1:-}"
     local verbose=1
-    [[ "$mode" == "--cron" ]] && verbose=0
+    [[ "$mode" == "--cron" || "$mode" == "--api" ]] && verbose=0
+    local started_at; started_at=$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')
 
     _skynet_censorcheck_refresh_cron
 
     ensure_package "curl" >/dev/null 2>&1 || true
     ensure_package "python3" >/dev/null 2>&1 || true
 
+    # Из панели (--api) проверка нужна и без Telegram: результат смотрят в
+    # интерфейсе. Отчёт тогда просто не отправляется.
+    local send_tg=1
     if [[ -z "${TG_BOT_TOKEN:-}" || -z "${TG_CHAT_ID:-}" ]]; then
-        [[ "$verbose" -eq 1 ]] && printf_error "TG_BOT_TOKEN/TG_CHAT_ID не настроены (пункт [n])."
-        log "CensorCheck: TG_BOT_TOKEN/TG_CHAT_ID не настроены, отчёт не отправлен."
-        return 1
+        if [[ "$mode" == "--api" ]]; then
+            send_tg=0
+        else
+            [[ "$verbose" -eq 1 ]] && printf_error "TG_BOT_TOKEN/TG_CHAT_ID не настроены (пункт [n])."
+            log "CensorCheck: TG_BOT_TOKEN/TG_CHAT_ID не настроены, отчёт не отправлен."
+            return 1
+        fi
     fi
 
     if [[ -z "${RIPE_API_KEY:-}" ]]; then
@@ -902,6 +985,11 @@ _skynet_censorcheck_run_and_report() {
             excluded_list+="• ${esc_ex_name}"$'\n'
         done < "${tmp_dir}/.excluded"
     fi
+
+    local run_source="cron"
+    [[ "$mode" == "--api" ]] && run_source="panel"
+    [[ "$verbose" -eq 1 ]] && run_source="menu"
+    _skynet_tspu_store_run "$tmp_dir" "$probes_out" "$started_at" "$run_source" "$sni"
 
     rm -rf "$tmp_dir"
 
@@ -1156,6 +1244,11 @@ _skynet_censorcheck_run_and_report() {
     if [[ -n "$mobile_list" ]]; then
         mobile_list="${mobile_list%$'\n'}"
         report+=$'\n'"<blockquote expandable>📱 <b>Мобильная сеть (${mobile_ok_n} из ${mobile_measured} доступно):</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
+    fi
+
+    if [[ "$send_tg" -eq 0 ]]; then
+        log "CensorCheck: проверка из панели (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено), Telegram не настроен - отчёт не отправлен."
+        return 0
     fi
 
     if _skynet_censorcheck_tg_send "$report"; then
@@ -1949,7 +2042,7 @@ _skynet_censorcheck_menu() {
                     sleep 1
                 else
                     echo ""
-                    _skynet_censorcheck_run_and_report
+                    _skynet_censorcheck_run_locked
                     wait_for_enter
                 fi
                 ;;
