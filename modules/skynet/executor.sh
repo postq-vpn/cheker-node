@@ -166,7 +166,7 @@ _skynet_run_plugin_on_fleet_parallel_capture() {
     local -a pids=()
     local i=0 name user ip port key_path sudo_pass category
     for line in "${lines[@]}"; do
-        IFS='|' read -r name user ip port key_path sudo_pass category <<< "$line"
+        IFS='|' read -r name user ip port key_path sudo_pass category _ <<< "$line"
         [[ -z "$name" ]] && continue
         category=$(_skynet_norm_category "$category")
         if [[ -n "$category_filter" && "$category" != "$category_filter" ]]; then
@@ -369,7 +369,7 @@ _run_fleet_command() {
             local servers=(); local idx=1
             echo ""
             printf_info "Доступные серверы:"
-            while IFS='|' read -r name user ip port key_path sudo_pass category; do
+            while IFS='|' read -r name user ip port key_path sudo_pass category _; do
                 servers[$idx]="$name|$user|$ip|$port|$key_path|$sudo_pass|$category"
                 printf "   [%d] %s (%s@%s:%s) [%s]\n" "$idx" "$name" "$user" "$ip" "$port" "$(_skynet_category_label "$category")"
                 ((idx++))
@@ -378,7 +378,7 @@ _run_fleet_command() {
             local s_choice
             s_choice=$(ask_number_in_range "Номер сервера: " 1 "$((idx-1))" "") || continue
             if [[ -n "${servers[$s_choice]:-}" ]]; then
-                IFS='|' read -r name user ip port key_path sudo_pass category <<< "${servers[$s_choice]}"
+                IFS='|' read -r name user ip port key_path sudo_pass category _ <<< "${servers[$s_choice]}"
                 printf_warning "Команда '${selected_plugin##*/}' будет выполнена на сервере '$name'."
                 if ask_yes_no "Начать? (y/n): " "n"; then
                     if _skynet_run_plugin_on_server "$selected_plugin" "$name" "$user" "$ip" "$port" "$key_path" "$sudo_pass"; then

@@ -50,7 +50,13 @@ _skynet_category_label() {
     esac
 }
 
+_skynet_valid_sni() {
+    local label='[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+    [[ ${#1} -le 253 && "$1" =~ ^${label}(\.${label})+$ && ! "$1" =~ ^[0-9.]+$ ]]
+}
+
 _sanitize_fleet_database() {
+    local name user ip port key_path sudo_pass category sni
     if [ -f "$FLEET_DATABASE_FILE" ]; then
         # Путь к ключу здесь не меняем: файл ключа остаётся со старым именем и
         # после переименования сервера или смены IP, а новый ключ на сервер не
@@ -63,14 +69,14 @@ _sanitize_fleet_database() {
         # явный "fleet", чтобы дальше по коду можно было просто читать поле
         # как есть, а не гадать "пусто = fleet" в каждом месте.
         local tmp_filter=$(mktemp)
-        while IFS='|' read -r name user ip port key_path sudo_pass category; do
+        while IFS='|' read -r name user ip port key_path sudo_pass category sni; do
             if [[ -z "$name" ]] || [[ "$name" == $'\e'* ]]; then
                 continue
             fi
             if [[ -z "$ip" ]]; then
                 continue
             fi
-            echo "$name|$user|$ip|$port|$key_path|$sudo_pass|$(_skynet_norm_category "$category")" >> "$tmp_filter"
+            echo "$name|$user|$ip|$port|$key_path|$sudo_pass|$(_skynet_norm_category "$category")|$sni" >> "$tmp_filter"
         done < "$FLEET_DATABASE_FILE"
         mv "$tmp_filter" "$FLEET_DATABASE_FILE"
     fi
@@ -88,19 +94,20 @@ _remove_key_path_from_fleet_db() {
     local deleted_key_path="$1"
     local original_file="$FLEET_DATABASE_FILE"
     local temp_file=$(mktemp)
+    local name user ip port key_path sudo_pass category sni
     local modified_count=0
 
     if [ ! -f "$original_file" ]; then
         return # No database to update
     fi
 
-    while IFS='|' read -r name user ip port key_path sudo_pass category; do
+    while IFS='|' read -r name user ip port key_path sudo_pass category sni; do
         if [[ "$key_path" == "$deleted_key_path" ]]; then
             # Found a matching entry, remove the key_path
-            echo "$name|$user|$ip|$port||$sudo_pass|$category" >> "$temp_file"
+            echo "$name|$user|$ip|$port||$sudo_pass|$category|$sni" >> "$temp_file"
             modified_count=$((modified_count + 1))
         else
-            echo "$name|$user|$ip|$port|$key_path|$sudo_pass|$category" >> "$temp_file"
+            echo "$name|$user|$ip|$port|$key_path|$sudo_pass|$category|$sni" >> "$temp_file"
         fi
     done < "$original_file"
 
@@ -120,8 +127,8 @@ _skynet_fleet_count_by_category() {
     local want="$1"
     [[ -f "$FLEET_DATABASE_FILE" ]] || { echo 0; return; }
 
-    local name user ip port key_path sudo_pass category count=0
-    while IFS='|' read -r name user ip port key_path sudo_pass category; do
+    local name user ip port key_path sudo_pass category sni count=0
+    while IFS='|' read -r name user ip port key_path sudo_pass category sni; do
         [[ -z "$name" ]] && continue
         [[ "$(_skynet_norm_category "$category")" == "$want" ]] && ((count++))
     done < "$FLEET_DATABASE_FILE"

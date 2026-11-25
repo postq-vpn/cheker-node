@@ -892,8 +892,8 @@ def _port_open(ip, port=443, timeout=4):
         return False
 
 
-def check_fleet(api_key, sni, targets, port_check=True):
-    """Замер всех серверов за один прогон. targets - [(ключ, ip)].
+def check_fleet(api_key, targets, port_check=True):
+    """Замер всех серверов за один прогон. targets - [(ключ, ip, sni)].
 
     Возвращает {ключ: [строки отчёта]}. Три фазы:
       1. Основной замер каждого сервера всеми зондами выборки - не больше
@@ -907,13 +907,13 @@ def check_fleet(api_key, sni, targets, port_check=True):
     """
     probes = load_probe_set(api_key)
     if not probes:
-        return {key: ["ERROR NO_PROBES"] for key, _ in targets}
+        return {key: ["ERROR NO_PROBES"] for key, _, _ in targets}
 
     meta = {p["id"]: p for p in probes}
     ids = [p["id"] for p in probes]
     out, results = {}, {}
 
-    def first_pass(key, ip):
+    def first_pass(key, ip, sni):
         # Без реально слушающего 443 RIPE Atlas покажет "заблокировано" для
         # всех зондов - но это не ТСПУ, а отсутствие VPN на сервере. Такой
         # замер не стоит ни кредитов, ни места в выборке.
@@ -938,11 +938,11 @@ def check_fleet(api_key, sni, targets, port_check=True):
     control_ok = set()
     control_error = None
     if all_missed:
-        ip_of = dict(targets)
+        endpoints = {key: (ip, sni) for key, ip, sni in targets}
 
         def retry(key):
             try:
-                res = measure(api_key, ip_of[key], sni, sorted(missed[key]))
+                res = measure(api_key, *endpoints[key], sorted(missed[key]))
                 return key, _failed_ids(res), res, None
             except RuntimeError as e:
                 return key, set(), None, str(e)
@@ -972,25 +972,27 @@ def check_fleet(api_key, sni, targets, port_check=True):
 
 def cmd_check(api_key, ip, sni):
     """Один сервер - для ручной отладки. Порт не проверяется."""
-    for line in check_fleet(api_key, sni, [("1", ip)], port_check=False)["1"]:
+    for line in check_fleet(api_key, [("1", ip, sni)], port_check=False)["1"]:
         print(line)
 
 
 def cmd_fleet(api_key, sni, targets_file, out_dir):
-    """Весь флот: targets_file - строки "<ключ>\\t<ip>", ответ по каждому
+    """Весь флот: targets_file - строки "<ключ>\\t<ip>[\\t<sni>]", ответ по каждому
     серверу - в <out_dir>/<ключ>.out (формат как у cmd_check, либо NOPORT)."""
     targets = []
     with open(targets_file, encoding="utf-8") as fh:
         for line in fh:
-            key, _, ip = line.strip().partition("\t")
-            if key and ip:
-                targets.append((key, ip))
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) == 2:
+                fields.append(sni)  # Разовая проверка с SNI из аргумента.
+            if len(fields) == 3 and all(fields):
+                targets.append(tuple(fields))
     if not targets:
         return
     try:
-        out = check_fleet(api_key, sni, targets)
+        out = check_fleet(api_key, targets)
     except Exception as e:
-        out = {key: [f"ERROR UNEXPECTED:{type(e).__name__}"] for key, _ in targets}
+        out = {key: [f"ERROR UNEXPECTED:{type(e).__name__}"] for key, _, _ in targets}
     for key, lines in out.items():
         with open(os.path.join(out_dir, f"{key}.out"), "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")

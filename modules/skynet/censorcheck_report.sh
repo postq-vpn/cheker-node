@@ -208,6 +208,19 @@ _skynet_tspu_excluded_count() {
     _skynet_tspu_csv_items "$excluded" | grep -c .
 }
 
+_skynet_tspu_target_count() {
+    local excluded name sni count=0
+    excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
+    if [[ -s "$FLEET_DATABASE_FILE" ]]; then
+        while IFS='|' read -r name _ _ _ _ _ _ sni; do
+            [[ -n "$name" && -n "$sni" ]] || continue
+            _skynet_tspu_csv_contains "${name%$'\r'}" "$excluded" && continue
+            count=$((count + 1))
+        done < "$FLEET_DATABASE_FILE"
+    fi
+    echo "$count"
+}
+
 # Отправляет ОДИН кусок текста (<=4096 символов) в Telegram.
 # Печатает HTTP-код ответа в stdout.
 _skynet_censorcheck_tg_send_chunk() {
@@ -385,8 +398,8 @@ _skynet_censorcheck_configure_ripe() {
     fi
 
     echo ""
-    printf_description "SNI, под который маскируется проверка (например, домен из вашего"
-    printf_description "Reality-конфига). По умолчанию как в исходном скрипте: max.ru"
+    printf_description "SNI для ручной проверки IP. При проверке флота используется"
+    printf_description "SNI из карточки каждого сервера."
     local sni; sni=$(ask_non_empty "SNI для пробы" "${TSPU_REALITY_SNI:-max.ru}") || return
 
     set_env_var "RIPE_API_KEY" "$key"
@@ -493,6 +506,7 @@ _skynet_tspu_summarize_server() {
     local head_line; head_line=$(head -1 "$file")
     case "$head_line" in
         OK\ *) ;;
+        NOSNI) echo "SKIP не указан SNI"; return ;;
         NOPORT)
             # Без реально слушающего 443 RIPE Atlas показал бы "заблокировано"
             # для всех зондов - но это не ТСПУ, а отсутствие VPN на сервере.
@@ -592,7 +606,7 @@ _skynet_tspu_summarize_server() {
 #   <tmp_dir>/N.out     - сырой выхлоп замера сервера N
 #   <tmp_dir>/N.result  - вердикт + строки CITY (см. _skynet_tspu_summarize_server)
 #   <tmp_dir>/.count    - количество проверенных серверов N
-#   <tmp_dir>/.targets  - "N<TAB>IP" для tspu_probe.py fleet
+#   <tmp_dir>/.targets  - "N<TAB>IP<TAB>SNI" для tspu_probe.py fleet
 #   <tmp_dir>/.excluded - имена серверов, пропущенных по TSPU_EXCLUDED_SERVERS
 #                         (по одному в строке), файла нет, если таких нет
 #
@@ -601,7 +615,7 @@ _skynet_tspu_summarize_server() {
 # зондов. Раньше здесь был питон на каждый сервер одновременно - ~25 МБ
 # памяти на сервер и контроль, повторённый N раз.
 _skynet_tspu_check_fleet_parallel() {
-    local sni="$1" api_key="$2"
+    local api_key="$1"
     local tmp_dir; tmp_dir=$(mktemp -d)
 
     local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
@@ -612,9 +626,9 @@ _skynet_tspu_check_fleet_parallel() {
         [[ -n "$line" ]] && lines+=("$line")
     done < "$FLEET_DATABASE_FILE"
 
-    local i=0 name user ip port key_path sudo_pass category
+    local i=0 name user ip port key_path sudo_pass category sni
     for line in "${lines[@]}"; do
-        IFS='|' read -r name user ip port key_path sudo_pass category <<< "$line"
+        IFS='|' read -r name user ip port key_path sudo_pass category sni <<< "$line"
         [[ -z "$name" ]] && continue
         category=$(_skynet_norm_category "$category")
         # Хвостовой \r (частый гость при вставке в SSH-терминал из Windows)
@@ -631,11 +645,16 @@ _skynet_tspu_check_fleet_parallel() {
         i=$((i + 1))
         echo "${name} (${ip})" > "${tmp_dir}/${i}.name"
         echo "$category" > "${tmp_dir}/${i}.category"
-        printf '%s\t%s\n' "$i" "$ip" >> "${tmp_dir}/.targets"
+        if [[ -z "$sni" ]]; then
+            echo NOSNI > "${tmp_dir}/${i}.out"
+            continue
+        fi
+        printf '%s\n' "$sni" > "${tmp_dir}/${i}.sni"
+        printf '%s\t%s\t%s\n' "$i" "$ip" "$sni" >> "${tmp_dir}/.targets"
     done
 
     if [[ -s "${tmp_dir}/.targets" ]]; then
-        _skynet_tspu_py fleet "$api_key" "$sni" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
+        _skynet_tspu_py fleet "$api_key" "" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
     fi
 
     echo "$i" > "${tmp_dir}/.count"
@@ -666,14 +685,14 @@ _skynet_tspu_asn_names_file() {
 # Сохраняет прогон флота в JSON (см. tspu_store.py). Сбой здесь не должен
 # мешать отчёту в Telegram - только пишется в лог.
 _skynet_tspu_store_run() {
-    local tmp_dir="$1" probes_out="$2" started="$3" source="$4" sni="$5"
+    local tmp_dir="$1" probes_out="$2" started="$3" source="$4"
     [[ -f "$_TSPU_STORE_SCRIPT" ]] || return 0
     mkdir -p "$_TSPU_STORE_DIR" 2>/dev/null || return 0
     printf '%s\n' "$probes_out" > "${tmp_dir}/.probes"
     _skynet_tspu_asn_names_file "${tmp_dir}/.asnnames"
     local run_id
     if run_id=$(python3 "$_TSPU_STORE_SCRIPT" run "$tmp_dir" "$_TSPU_STORE_DIR" \
-            "${tmp_dir}/.probes" "${tmp_dir}/.asnnames" "$started" "$source" "$sni" 2>&1); then
+            "${tmp_dir}/.probes" "${tmp_dir}/.asnnames" "$started" "$source" 2>&1); then
         log "CensorCheck: результат сохранён (${run_id})."
     else
         log "CensorCheck: не удалось сохранить результат в JSON: ${run_id}"
@@ -759,11 +778,13 @@ _skynet_censorcheck_run_and_report() {
         return 1
     fi
 
-    local sni="${TSPU_REALITY_SNI:-max.ru}"
 
     # Состав выборки берём ДО прогона: заодно кэш зондов соберётся один раз,
     # а не в каждом из параллельных замеров сразу.
-    local probes_out; probes_out=$(_skynet_tspu_py probes "$RIPE_API_KEY" 2>/dev/null)
+    local probes_out="OK 0 0"
+    if [[ $(_skynet_tspu_target_count) -gt 0 ]]; then
+        probes_out=$(_skynet_tspu_py probes "$RIPE_API_KEY" 2>/dev/null)
+    fi
     if [[ "$probes_out" != OK\ * ]]; then
         [[ "$verbose" -eq 1 ]] && printf_error "Не удалось собрать выборку зондов RIPE Atlas (${probes_out:-нет ответа})."
         log "CensorCheck: не удалось собрать выборку зондов (${probes_out:-нет ответа})."
@@ -794,7 +815,7 @@ _skynet_censorcheck_run_and_report() {
     fi
 
     if [[ "$verbose" -eq 1 ]]; then
-        printf_info "Проверяю доступность всех серверов флота из сетей РФ (RIPE Atlas, параллельно)."
+        printf_info "Проверяю доступность серверов флота с указанным SNI из сетей РФ (RIPE Atlas, параллельно)."
         printf_info "Выборка: ${sample_line}, по одному замеру на сервер."
         printf_info "Промахи перепроверяются отдельно — это займёт пару минут."
 
@@ -804,7 +825,7 @@ _skynet_censorcheck_run_and_report() {
         fi
     fi
 
-    local tmp_dir; tmp_dir=$(_skynet_tspu_check_fleet_parallel "$sni" "$RIPE_API_KEY")
+    local tmp_dir; tmp_dir=$(_skynet_tspu_check_fleet_parallel "$RIPE_API_KEY")
     local count; count=$(cat "${tmp_dir}/.count" 2>/dev/null || echo 0)
 
     # Все три группы - одинаковый вид: сворачиваемая (expandable) цитата
@@ -989,7 +1010,7 @@ _skynet_censorcheck_run_and_report() {
     local run_source="cron"
     [[ "$mode" == "--api" ]] && run_source="panel"
     [[ "$verbose" -eq 1 ]] && run_source="menu"
-    _skynet_tspu_store_run "$tmp_dir" "$probes_out" "$started_at" "$run_source" "$sni"
+    _skynet_tspu_store_run "$tmp_dir" "$probes_out" "$started_at" "$run_source"
 
     rm -rf "$tmp_dir"
 
@@ -1679,11 +1700,8 @@ _skynet_censorcheck_probe_set_menu() {
         # перепроверка тратится только на промахнувшиеся зонды, и на спокойном
         # флоте её просто нет. При реальной блокировке добавится повтор по
         # промахнувшимся зондам каждого сервера и один общий контроль.
-        local fleet_n=0
-        [[ -s "$FLEET_DATABASE_FILE" ]] && fleet_n=$(grep -c . "$FLEET_DATABASE_FILE")
+        local fleet_n; fleet_n=$(_skynet_tspu_target_count)
         local excluded_n; excluded_n=$(_skynet_tspu_excluded_count)
-        fleet_n=$(( fleet_n - excluded_n ))
-        [[ "$fleet_n" -lt 0 ]] && fleet_n=0
         local per_msm=$(( probe_n * _CENSORCHECK_CREDITS_PER_PROBE ))
         local per_run=$(( per_msm * fleet_n ))
         local runs; runs=$(_skynet_censorcheck_times | grep -c .)
@@ -1756,8 +1774,8 @@ _skynet_censorcheck_servers_menu() {
         local excluded; excluded=$(get_config_var "TSPU_EXCLUDED_SERVERS")
 
         local -a names=()
-        local i=1 name user ip port key_path sudo_pass category
-        while IFS='|' read -r name user ip port key_path sudo_pass category; do
+        local i=1 name user ip port key_path sudo_pass category sni
+        while IFS='|' read -r name user ip port key_path sudo_pass category sni; do
             [[ -z "$name" ]] && continue
             name="${name%$'\r'}"
             names[$i]="$name"
@@ -1765,6 +1783,8 @@ _skynet_censorcheck_servers_menu() {
             local status status_color
             if _skynet_tspu_csv_contains "$name" "$excluded"; then
                 status="ИСКЛЮЧЁН"; status_color="${C_RED}"
+            elif [[ -z "$sni" ]]; then
+                status="БЕЗ SNI"; status_color="${C_YELLOW}"
             else
                 status="ПРОВЕРЯЕТСЯ"; status_color="${C_GREEN}"
             fi
@@ -1997,9 +2017,9 @@ _skynet_censorcheck_menu() {
         local mode_status="${C_GREEN}по географии${C_RESET} (города и операторы)"
         [[ "${TSPU_CHECK_MODE:-geo}" == "common" ]] && mode_status="${C_GREEN}общая${C_RESET} (без разбивки по городам)"
 
-        local servers_status="${C_GREEN}все${C_RESET}"
+        local servers_status="со своим SNI: $(_skynet_tspu_target_count)"
         local excluded_n_status; excluded_n_status=$(_skynet_tspu_excluded_count)
-        [[ "$excluded_n_status" -gt 0 ]] && servers_status="${C_YELLOW}исключено ${excluded_n_status}${C_RESET}"
+        [[ "$excluded_n_status" -gt 0 ]] && servers_status+=", ${C_YELLOW}исключено ${excluded_n_status}${C_RESET}"
 
         printf_description "Telegram:          ${tg_status}"
         printf_description "RIPE Atlas ключ:   ${ripe_status}"

@@ -18,7 +18,7 @@
 #   <tmp>/.excluded   исключённые из проверки, по имени в строке
 #
 # Режимы:
-#   tspu_store.py run   <tmp_dir> <store_dir> <probes_file> <asn_file> <started> <source> <sni>
+#   tspu_store.py run   <tmp_dir> <store_dir> <probes_file> <asn_file> <started> <source>
 #   tspu_store.py check <tmp_dir> <out_file>  <probes_file> <asn_file> <started> <target> <ip> <sni>
 #
 # probes_file - вывод `tspu_probe.py probes` (OK <зондов> <городов>, CITY, MOBILE),
@@ -120,6 +120,7 @@ def parse_server(tmp_dir, idx):
         "name": name,
         "ip": ip,
         "category": category,
+        "sni": _read(os.path.join(tmp_dir, f"{idx}.sni")).strip() or None,
         "status": status,
         "detail": detail.strip(),
         "percent": None,
@@ -236,7 +237,7 @@ def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def cmd_run(tmp_dir, store_dir, probes_file, asn_file, started, source, sni):
+def cmd_run(tmp_dir, store_dir, probes_file, asn_file, started, source):
     servers, excluded = _collect(tmp_dir)
     names = load_asn_names(asn_file)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -245,7 +246,7 @@ def cmd_run(tmp_dir, store_dir, probes_file, asn_file, started, source, sni):
         "startedAt": started,
         "finishedAt": _now(),
         "source": source,
-        "sni": sni,
+        "sni": None,
         "sample": parse_probes(probes_file),
         "summary": _summary(servers, excluded),
         "servers": servers,
@@ -271,6 +272,8 @@ def cmd_check(tmp_dir, out_file, probes_file, asn_file, started, target, ip, sni
     servers, _ = _collect(tmp_dir)
     names = load_asn_names(asn_file)
     server = servers[0] if servers else None
+    if server:
+        server["sni"] = sni
     data = {
         "status": "done",
         "target": target,
@@ -287,7 +290,7 @@ def cmd_check(tmp_dir, out_file, probes_file, asn_file, started, target, ip, sni
 
 def main():
     args = sys.argv[1:]
-    if len(args) == 8 and args[0] == "run":
+    if len(args) == 7 and args[0] == "run":
         cmd_run(*args[1:])
         return 0
     if len(args) == 9 and args[0] == "check":

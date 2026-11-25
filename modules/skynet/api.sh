@@ -25,7 +25,7 @@
 #   fleet list                      - серверы флота
 #   fleet ping                      - доступность SSH-порта и 443 у каждого
 #   fleet hostkey <хост> [порт]     - отпечатки ключа хоста до добавления
-#   fleet add                       - stdin: {name,host,user,port,category,password,acceptFingerprints,privateKey}
+#   fleet add                       - stdin: {name,host,user,port,category,sni,password,acceptFingerprints,privateKey}
 #   fleet update <N>                - stdin: {expectName, ...поля как у add}
 #   fleet delete <N>                - stdin: {expectName}
 #   tspu status                     - настройки, расписание, идёт ли прогон
@@ -111,7 +111,7 @@ _api_valid_port() {
 #                            ФЛОТ                              #
 # ------------------------------------------------------------ #
 
-# Строка базы N (с 1) -> "name|user|ip|port|key|pass|category", пусто если нет.
+# Строка базы N (с 1) -> "name|user|ip|port|key|pass|category|sni", пусто если нет.
 _api_fleet_line() {
     [[ -f "$FLEET_DATABASE_FILE" ]] || return 1
     sed -n "${1}p" "$FLEET_DATABASE_FILE"
@@ -126,18 +126,18 @@ _api_fleet_list() {
     mapfile -t excl < <(_skynet_tspu_csv_items "$excluded")
 
     # Пароль не покидает этот процесс: в JSON только признак hasPassword.
-    local rows="" n=0 name user ip port key_path sudo_pass category
+    local rows="" n=0 name user ip port key_path sudo_pass category sni
     if [[ -f "$FLEET_DATABASE_FILE" ]]; then
-        while IFS='|' read -r name user ip port key_path sudo_pass category; do
+        while IFS='|' read -r name user ip port key_path sudo_pass category sni; do
             n=$((n + 1))
             [[ -z "$name" ]] && continue
             rows+=$(jq -nc --argjson n "$n" --arg name "$name" --arg user "$user" \
                 --arg host "$ip" --arg port "${port:-22}" --arg key "$(basename "${key_path:-}")" \
                 --argjson haspass "$([[ -n "$sudo_pass" ]] && echo true || echo false)" \
-                --arg category "$(_skynet_norm_category "$category")" \
+                --arg sni "$sni" --arg category "$(_skynet_norm_category "$category")" \
                 '{index: $n, name: $name, user: $user, host: $host, port: ($port|tonumber? // 22),
                   key: (if $key == "" then null else $key end), hasPassword: $haspass,
-                  category: $category}')$'\n'
+                  category: $category, sni: $sni}')$'\n'
         done < "$FLEET_DATABASE_FILE"
     fi
 
@@ -151,9 +151,9 @@ _api_fleet_list() {
 # ключ, ни пароль, и fail2ban на сервере не тревожится.
 _api_fleet_ping() {
     local tmp_dir; tmp_dir=$(mktemp -d) || { _api_err INTERNAL "mktemp"; return; }
-    local n=0 name user ip port key_path sudo_pass category
+    local n=0 name user ip port key_path sudo_pass category sni
     if [[ -f "$FLEET_DATABASE_FILE" ]]; then
-        while IFS='|' read -r name user ip port key_path sudo_pass category; do
+        while IFS='|' read -r name user ip port key_path sudo_pass category sni; do
             n=$((n + 1))
             [[ -n "$ip" ]] || continue
             (
@@ -403,14 +403,14 @@ _api_name_taken() {
 
 _api_fleet_add() {
     _api_read_input || { _api_err BAD_INPUT "Ожидается JSON-объект в stdin."; return; }
-    # До чтения полей: _sanitize_fleet_database читает базу в НЕлокальные
-    # name/user/ip/... и затёр бы одноимённые переменные здесь.
-    _sanitize_fleet_database
-    local name host user port category password accept
+    local name host user port category password sni accept
     name=$(_api_in name); host=$(_api_in host)
     user=$(_api_in user); user="${user:-$SKYNET_DEFAULT_USER}"
     port=$(_api_in port); port="${port:-$SKYNET_DEFAULT_PORT}"
     category=$(_api_in category); category="${category:-fleet}"
+    sni=$(_api_in sni)
+    _skynet_valid_sni "$sni" || { _api_err BAD_SNI "Укажите доменное имя SNI сервера."; return; }
+    _sanitize_fleet_database
     password=$(_api_in password)
     accept=$(jq -c '.acceptFingerprints // []' <<< "$_API_INPUT")
 
@@ -431,7 +431,7 @@ _api_fleet_add() {
         return
     fi
 
-    echo "${name}|${user}|${host}|${port}|${key}|${password}|${category}" >> "$FLEET_DATABASE_FILE"
+    echo "${name}|${user}|${host}|${port}|${key}|${password}|${category}|${sni}" >> "$FLEET_DATABASE_FILE"
     chmod 600 "$FLEET_DATABASE_FILE" 2>/dev/null || true
     log "Skynet API: сервер '${name}' (${host}) добавлен из панели."
     _api_fleet_list
@@ -443,17 +443,22 @@ _api_fleet_update() {
     _api_read_input || { _api_err BAD_INPUT "Ожидается JSON-объект в stdin."; return; }
 
     local line; line=$(_api_fleet_line "$n")
-    local o_name o_user o_ip o_port o_key o_pass o_cat
-    IFS='|' read -r o_name o_user o_ip o_port o_key o_pass o_cat <<< "$line"
+    local o_name o_user o_ip o_port o_key o_pass o_cat o_sni
+    IFS='|' read -r o_name o_user o_ip o_port o_key o_pass o_cat o_sni <<< "$line"
     [[ -n "$o_name" && "$o_name" == "$(_api_in expectName)" ]] \
         || { _api_err STALE "База флота изменилась — обнови список и повтори."; return; }
 
-    local name host user port category password
+    local name host user port category password sni
     name=$(_api_in name); name="${name:-$o_name}"
     host=$(_api_in host); host="${host:-$o_ip}"
     user=$(_api_in user); user="${user:-$o_user}"
     port=$(_api_in port); port="${port:-${o_port:-22}}"
     category=$(_api_in category); category="${category:-$(_skynet_norm_category "$o_cat")}"
+    sni="$o_sni"
+    if _api_has sni; then
+        sni=$(_api_in sni)
+        _skynet_valid_sni "$sni" || { _api_err BAD_SNI "Укажите доменное имя SNI сервера."; return; }
+    fi
     # password: нет поля - оставить, "" - очистить, строка - задать.
     if _api_has password; then password=$(_api_in password); else password="$o_pass"; fi
 
@@ -481,7 +486,7 @@ _api_fleet_update() {
         fi
     fi
 
-    _update_fleet_record "$n" "${name}|${user}|${host}|${port}|${key}|${password}|${category}"
+    _update_fleet_record "$n" "${name}|${user}|${host}|${port}|${key}|${password}|${category}|${sni}"
 
     # Переименование не должно молча вернуть сервер в проверку ТСПУ.
     if [[ "$name" != "$o_name" ]]; then
@@ -581,7 +586,7 @@ _api_tspu_status() {
         --argjson tg "$([[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] && echo true || echo false)" \
         --arg sni "${TSPU_REALITY_SNI:-max.ru}" --arg mode "${TSPU_CHECK_MODE:-geo}" \
         --argjson times "$times_json" --argjson excluded "$excluded_json" \
-        --argjson fleet "$fleet_n" --argjson infra "$infra_n" --argjson excl_n "$excluded_n" \
+        --argjson eligible "$(_skynet_tspu_target_count)" --argjson fleet "$fleet_n" --argjson infra "$infra_n" --argjson excl_n "$excluded_n" \
         --argjson running "$(_api_tspu_running_json)" --argjson sample "$(_api_tspu_sample_json)" \
         --argjson last "$last" --argjson lastError "$last_error" \
         --argjson credits "$_CENSORCHECK_CREDITS_PER_PROBE" --argjson soft "$_CENSORCHECK_SOFT_LIMIT" \
@@ -598,7 +603,7 @@ _api_tspu_status() {
           sample: $sample,
           creditsPerProbe: $credits,
           estimatedCredits: (if $sample == null then null
-                             else $sample.probes * $credits * ($fleet + $infra - $excl_n) end),
+                             else $sample.probes * $credits * $eligible end),
           running: $running, last: $last, lastError: $lastError}')"
 }
 

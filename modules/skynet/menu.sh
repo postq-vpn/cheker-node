@@ -45,11 +45,24 @@ _skynet_is_local_newer() {
 #                ДЕЙСТВИЯ МЕНЮ SKYNET                          #
 # ============================================================ #
 
+_skynet_read_sni() {
+    local current="${1:-}" allow_empty="${2:-no}" value
+    while true; do
+        value=$(safe_read "SNI сервера (домен)" "$current") || return 130
+        if [[ -z "$value" && "$allow_empty" == yes ]] || _skynet_valid_sni "$value"; then
+            printf '%s' "$value"
+            return
+        fi
+        printf_warning "Укажите доменное имя, например example.org." >&2
+    done
+}
+
 _skynet_add_server_wizard() {
     echo
     printf_info "--- НОВЫЙ СЕРВЕР ---"
     local s_name; s_name=$(ask_non_empty "Имя сервера: ") || return; s_name="${s_name//|/}"
     local s_ip; s_ip=$(ask_non_empty "IP адрес: ") || return; s_ip="${s_ip//|/}"
+    local s_sni; s_sni=$(_skynet_read_sni) || return
     local s_user; s_user=$(safe_read "Пользователь: " "$SKYNET_DEFAULT_USER"); s_user="${s_user//|/}"
     local s_port; s_port=$(safe_read "SSH порт: " "$SKYNET_DEFAULT_PORT"); s_port="${s_port//|/}"
     local s_pass=""
@@ -113,7 +126,7 @@ _skynet_add_server_wizard() {
     echo
     printf_info "🚀 Пробуем закинуть ключ на сервер..."
     if _deploy_key_to_host "$s_ip" "$s_port" "$s_user" "$final_key"; then
-        echo "$s_name|$s_user|$s_ip|$s_port|$final_key|$s_pass|$s_category" >> "$FLEET_DATABASE_FILE"
+        echo "$s_name|$s_user|$s_ip|$s_port|$final_key|$s_pass|$s_category|$s_sni" >> "$FLEET_DATABASE_FILE"
         printf_ok "Сервер '${s_name}' добавлен в флот."
         
         # Проверяем соединение и предлагаем усилить безопасность
@@ -212,7 +225,7 @@ show_fleet_menu() {
             local i=1
             local line name user ip port key_path sudo_pass category
             for line in "${raw_lines[@]}"; do
-                IFS='|' read -r name user ip port key_path sudo_pass category <<< "$line"
+                IFS='|' read -r name user ip port key_path sudo_pass category _ <<< "$line"
                 local status_text=" выкл"
                 if [[ "$auto_scan" == "on" ]]; then
                     if [[ -f "$tmp_dir/$i" ]]; then status_text=$(cat "$tmp_dir/$i"); else status_text="?"; fi
@@ -319,8 +332,8 @@ show_fleet_menu() {
 
 _show_server_management_menu() {
     local server_idx="$1"; local server_data="$2"; enable_graceful_ctrlc
-    local s_name s_user s_ip s_port s_key s_pass s_category
-    IFS='|' read -r s_name s_user s_ip s_port s_key s_pass s_category <<< "$server_data"
+    local s_name s_user s_ip s_port s_key s_pass s_category s_sni
+    IFS='|' read -r s_name s_user s_ip s_port s_key s_pass s_category s_sni <<< "$server_data"
     s_category=$(_skynet_norm_category "$s_category")
     
     _sm_connect() {
@@ -371,7 +384,7 @@ _show_server_management_menu() {
                 printf "${C_YELLOW}требуется пароль${C_RESET}\n"
                 s_pass=$(ask_password "Введите пароль sudo для '$s_user': ")
                 if [[ -n "$s_pass" ]] && ask_yes_no "Сохранить пароль в базу?" "n"; then
-                    server_data="$s_name|$s_user|$s_ip|$s_port|$s_key|$s_pass|$s_category"
+                    server_data="$s_name|$s_user|$s_ip|$s_port|$s_key|$s_pass|$s_category|$s_sni"
                     _update_fleet_record "$server_idx" "$server_data"
                     ok "Пароль сохранён."
                 fi
@@ -554,7 +567,8 @@ REMOTE_SCRIPT
             1) cat="fleet" ;;
             2) cat="infra" ;;
         esac
-        server_data="${n}|${u}|${i}|${p}|${k}|${pw}|${cat}"; _update_fleet_record "$server_idx" "$server_data"; s_name=$n; s_user=$u; s_ip=$i; s_port=$p; s_key=$k; s_pass=$pw; s_category=$cat; ok "Запись обновлена."; wait_for_enter
+        local new_sni; new_sni=$(_skynet_read_sni "$s_sni" yes) || return
+        server_data="${n}|${u}|${i}|${p}|${k}|${pw}|${cat}|${new_sni}"; _update_fleet_record "$server_idx" "$server_data"; s_name=$n; s_user=$u; s_ip=$i; s_port=$p; s_key=$k; s_pass=$pw; s_category=$cat; s_sni=$new_sni; ok "Запись обновлена."; wait_for_enter
     }
     _sm_delete() { 
         if ask_yes_no "Удалить сервер '${s_name}'?" "n"; then 
@@ -601,8 +615,8 @@ _show_server_security_menu() {
     local server_data="$2"
     enable_graceful_ctrlc
 
-    local s_name s_user s_ip s_port s_key s_pass s_category
-    IFS='|' read -r s_name s_user s_ip s_port s_key s_pass s_category <<< "$server_data"
+    local s_name s_user s_ip s_port s_key s_pass s_category s_sni
+    IFS='|' read -r s_name s_user s_ip s_port s_key s_pass s_category s_sni <<< "$server_data"
     s_category=$(_skynet_norm_category "$s_category")
 
     # --- Вспомогательная функция для проброса GWL ---
@@ -644,7 +658,7 @@ _show_server_security_menu() {
         if [[ "$rc" -eq 0 ]]; then
             ok "Порт успешно изменен на стороне сервера. Обновляю базу Skynet..."
             s_port=$new_port
-            local new_server_data="${s_name}|${s_user}|${s_ip}|${s_port}|${s_key}|${s_pass}|${s_category}"
+            local new_server_data="${s_name}|${s_user}|${s_ip}|${s_port}|${s_key}|${s_pass}|${s_category}|${s_sni}"
             _update_fleet_record "$server_idx" "$new_server_data"
             ok "База данных обновлена. Новый порт: $s_port"
         else
