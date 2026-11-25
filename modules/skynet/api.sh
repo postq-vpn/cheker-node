@@ -409,7 +409,7 @@ _api_fleet_add() {
     port=$(_api_in port); port="${port:-$SKYNET_DEFAULT_PORT}"
     category=$(_api_in category); category="${category:-fleet}"
     sni=$(_api_in sni)
-    _skynet_valid_sni "$sni" || { _api_err BAD_SNI "Укажите доменное имя SNI сервера."; return; }
+    _skynet_valid_server_sni "$category" "$sni" || { _api_err BAD_SNI "Укажите доменное имя SNI сервера."; return; }
     _sanitize_fleet_database
     password=$(_api_in password)
     accept=$(jq -c '.acceptFingerprints // []' <<< "$_API_INPUT")
@@ -457,7 +457,9 @@ _api_fleet_update() {
     sni="$o_sni"
     if _api_has sni; then
         sni=$(_api_in sni)
-        _skynet_valid_sni "$sni" || { _api_err BAD_SNI "Укажите доменное имя SNI сервера."; return; }
+    fi
+    if _api_has sni || [[ "$category" != "$(_skynet_norm_category "$o_cat")" ]]; then
+        _skynet_valid_server_sni "$category" "$sni" || { _api_err BAD_SNI "Укажите доменное имя SNI сервера."; return; }
     fi
     # password: нет поля - оставить, "" - очистить, строка - задать.
     if _api_has password; then password=$(_api_in password); else password="$o_pass"; fi

@@ -55,6 +55,11 @@ _skynet_valid_sni() {
     [[ ${#1} -le 253 && "$1" =~ ^${label}(\.${label})+$ && ! "$1" =~ ^[0-9.]+$ ]]
 }
 
+_skynet_valid_server_sni() {
+    local category="$1" sni="$2"
+    [[ "$category" == infra && -z "$sni" ]] || _skynet_valid_sni "$sni"
+}
+
 _sanitize_fleet_database() {
     local name user ip port key_path sudo_pass category sni
     if [ -f "$FLEET_DATABASE_FILE" ]; then

@@ -46,10 +46,19 @@ _skynet_is_local_newer() {
 # ============================================================ #
 
 _skynet_read_sni() {
-    local current="${1:-}" allow_empty="${2:-no}" value
+    local category="$1" current="${2:-}" allow_legacy_empty="${3:-no}" value
+    local prompt="SNI сервера (домен)"
+    if [[ "$category" == infra ]]; then
+        if [[ -n "$current" ]]; then
+            prompt="SNI сервера (домен, минус для удаления)"
+        else
+            prompt="SNI сервера (необязательно, Enter для пропуска)"
+        fi
+    fi
     while true; do
-        value=$(safe_read "SNI сервера (домен)" "$current") || return 130
-        if [[ -z "$value" && "$allow_empty" == yes ]] || _skynet_valid_sni "$value"; then
+        value=$(safe_read "$prompt" "$current") || return 130
+        [[ "$category" == infra && "$value" == "-" ]] && value=""
+        if [[ -z "$value" && "$allow_legacy_empty" == yes ]] || _skynet_valid_server_sni "$category" "$value"; then
             printf '%s' "$value"
             return
         fi
@@ -62,7 +71,6 @@ _skynet_add_server_wizard() {
     printf_info "--- НОВЫЙ СЕРВЕР ---"
     local s_name; s_name=$(ask_non_empty "Имя сервера: ") || return; s_name="${s_name//|/}"
     local s_ip; s_ip=$(ask_non_empty "IP адрес: ") || return; s_ip="${s_ip//|/}"
-    local s_sni; s_sni=$(_skynet_read_sni) || return
     local s_user; s_user=$(safe_read "Пользователь: " "$SKYNET_DEFAULT_USER"); s_user="${s_user//|/}"
     local s_port; s_port=$(safe_read "SSH порт: " "$SKYNET_DEFAULT_PORT"); s_port="${s_port//|/}"
     local s_pass=""
@@ -76,6 +84,7 @@ _skynet_add_server_wizard() {
     local s_cat_choice; s_cat_choice=$(safe_read "Выбор (1-2): " "1")
     local s_category="fleet"
     [[ "$s_cat_choice" == "2" ]] && s_category="infra"
+    local s_sni; s_sni=$(_skynet_read_sni "$s_category") || return
 
     echo
     if ! _skynet_confirm_and_pin_host_key "$s_ip" "$s_port"; then
@@ -567,7 +576,9 @@ REMOTE_SCRIPT
             1) cat="fleet" ;;
             2) cat="infra" ;;
         esac
-        local new_sni; new_sni=$(_skynet_read_sni "$s_sni" yes) || return
+        local allow_legacy_empty=no
+        [[ "$cat" == "$s_category" && -z "$s_sni" ]] && allow_legacy_empty=yes
+        local new_sni; new_sni=$(_skynet_read_sni "$cat" "$s_sni" "$allow_legacy_empty") || return
         server_data="${n}|${u}|${i}|${p}|${k}|${pw}|${cat}|${new_sni}"; _update_fleet_record "$server_idx" "$server_data"; s_name=$n; s_user=$u; s_ip=$i; s_port=$p; s_key=$k; s_pass=$pw; s_category=$cat; s_sni=$new_sni; ok "Запись обновлена."; wait_for_enter
     }
     _sm_delete() { 
