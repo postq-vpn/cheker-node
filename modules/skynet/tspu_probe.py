@@ -33,6 +33,7 @@ import json
 import math
 import os
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -802,13 +803,16 @@ def summarize(meta, results, again_failed, control_ok, again_results=None,
             return [f"ERROR RETRY_FAILED:{len(missed)}/{seen}:{retry_error}"]
 
     confirmed, noise, dead = set(), set(), set()
+    retry_ok = _ok_ids(again_results or [])
     for pid in missed:
         if pid not in control_ok:
             dead.add(pid)
         elif pid in again_failed:
             confirmed.add(pid)
-        else:
+        elif pid in retry_ok:
             noise.add(pid)
+        else:
+            dead.add(pid)
 
     # Молчуны (зонд не вернул результата вовсе) и fault в знаменатель не
     # идут: они ничего не говорят ни за блокировку, ни против неё.
@@ -887,12 +891,35 @@ def summarize(meta, results, again_failed, control_ok, again_results=None,
     return lines
 
 
-def _port_open(ip, port=443, timeout=4):
+def _tcp_sample(ip, port, timeout, attempts):
+    for attempt in range(attempts):
+        try:
+            with socket.create_connection((ip, port), timeout=timeout):
+                return 1, attempt + 1
+        except OSError:
+            if attempt < attempts - 1:
+                time.sleep(1)
+
+    return 0, attempts
+
+
+def _port_open(ip, port=443, timeout=5, attempts=3):
+    return bool(_tcp_sample(ip, port, timeout, attempts)[0])
+
+
+def _ru_vps_tls(ip, sni):
+    if os.environ.get("TSPU_LOCAL_RU_VPS") != "1":
+        return "NOT_MEASURED"
+    # Проверяем завершение рукопожатия с заданным SNI, без проверки цепочки CA.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+        with socket.create_connection((ip, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=sni):
+                return "AVAILABLE"
+    except (OSError, ValueError, UnicodeError):
+        return "UNAVAILABLE"
 
 
 def check_fleet(api_key, targets, port_check=True):
@@ -908,27 +935,38 @@ def check_fleet(api_key, targets, port_check=True):
          цель), а при массовой блокировке как раз у всех есть промахи.
       3. Сборка строк по каждому серверу (summarize).
     """
-    probes = load_probe_set(api_key)
-    if not probes:
-        return {key: ["ERROR NO_PROBES"] for key, _, _ in targets}
+    try:
+        probes = load_probe_set(api_key)
+    except (OSError, ValueError, RuntimeError):
+        probes = []
 
     meta = {p["id"]: p for p in probes}
     ids = [p["id"] for p in probes]
     out, results = {}, {}
 
     def first_pass(key, ip, sni):
-        # Без реально слушающего 443 RIPE Atlas покажет "заблокировано" для
-        # всех зондов - но это не ТСПУ, а отсутствие VPN на сервере. Такой
-        # замер не стоит ни кредитов, ни места в выборке.
-        if port_check and not _port_open(ip):
-            return key, None, "NOPORT"
+        local = []
+        if port_check:
+            ok, attempts = _tcp_sample(ip, 443, 5, 3)
+            local.append(f"TCP {ok} {attempts}")
+            local.append(f"RU_TLS {_ru_vps_tls(ip, sni)}")
+        if not ids:
+            return key, None, "ERROR NO_PROBES", local
         try:
-            return key, measure(api_key, ip, sni, ids), None
+            res = measure(api_key, ip, sni, ids)
+            usable = {r["prb_id"] for r in res if r.get("prb_id") and classify(r) != "fault"}
+            certificates = {r["prb_id"] for r in res if r.get("prb_id") and r.get("cert")}
+            local.append(f"ATLAS_TLS {len(certificates)} {len(usable)}")
+            if _ok_ids(res):
+                local.append("ATLAS_REACHED")
+            return key, res, None, local
         except RuntimeError as e:
-            return key, None, f"ERROR {e}"
+            return key, None, f"ERROR {e}", local
 
+    observations = {}
     with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
-        for key, res, err in pool.map(lambda t: first_pass(*t), targets):
+        for key, res, err, local in pool.map(lambda t: first_pass(*t), targets):
+            observations[key] = local
             if err:
                 out[key] = [err]
             else:
@@ -970,12 +1008,14 @@ def check_fleet(api_key, targets, port_check=True):
         out[key] = summarize(meta, res, again_failed.get(key, set()), control_ok,
                              again_results.get(key), control_error,
                              retry_errors.get(key))
+    for key, lines in out.items():
+        lines.extend(observations[key])
     return out
 
 
 def cmd_check(api_key, ip, sni):
-    """Один сервер - для ручной отладки. Порт не проверяется."""
-    for line in check_fleet(api_key, [("1", ip, sni)], port_check=False)["1"]:
+    """Один сервер с теми же показателями, что и при проверке флота."""
+    for line in check_fleet(api_key, [("1", ip, sni)])["1"]:
         print(line)
 
 

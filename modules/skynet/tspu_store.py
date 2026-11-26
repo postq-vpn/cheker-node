@@ -101,6 +101,44 @@ def _asn_list(field):
     return out
 
 
+def parse_metrics(lines):
+    metrics = {
+        "server": "UNKNOWN", "tcpPercent": None, "tcpOk": None, "tcpAttempts": None,
+        "atlasTlsPercent": None, "atlasTlsOk": None, "atlasTlsTotal": None,
+        "ruVpsTls": "NOT_MEASURED", "tspu": "UNKNOWN", "vpn": "NOT_MEASURED",
+    }
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 3 and parts[0] in ("TCP", "ATLAS_TLS"):
+            ok, total = (_int(v) for v in parts[1:])
+            if total > 0 and 0 <= ok <= total:
+                tcp = parts[0] == "TCP"
+                metrics["tcpOk" if tcp else "atlasTlsOk"] = ok
+                metrics["tcpAttempts" if tcp else "atlasTlsTotal"] = total
+                metrics["tcpPercent" if tcp else "atlasTlsPercent"] = ok * 100 // total
+                if ok:
+                    metrics["server"] = "AVAILABLE"
+        elif line == "ATLAS_REACHED" or line == "RU_TLS AVAILABLE":
+            metrics["server"] = "AVAILABLE"
+        if len(parts) == 2 and parts[0] == "RU_TLS":
+            metrics["ruVpsTls"] = parts[1]
+        if len(parts) >= 4 and parts[0] == "OK":
+            ok, total = _int(parts[2]), _int(parts[3])
+            if total:
+                metrics["tspu"] = "NO_SIGNS" if ok == total else "SUSPECTED FILTERING"
+    return metrics
+
+
+def format_metrics(metrics):
+    def percent(key):
+        value = metrics[key]
+        return "нет данных" if value is None else f"{value}%"
+
+    return (f"Сервер {metrics['server']} · TCP {percent('tcpPercent')} · "
+            f"TLS Atlas {percent('atlasTlsPercent')} · TLS RU VPS {metrics['ruVpsTls']} · "
+            f"ТСПУ {metrics['tspu']} · VPN требуется отдельный замер")
+
+
 def parse_server(tmp_dir, idx):
     """Один сервер из файлов прогона."""
     label = _read(os.path.join(tmp_dir, f"{idx}.name")).strip()
@@ -116,12 +154,15 @@ def parse_server(tmp_dir, idx):
     kind, _, detail = head.partition(" ")
     status = {"AVAILABLE": "available", "BLOCKED": "blocked"}.get(kind, "skipped")
 
+    metrics = parse_metrics(raw_lines)
     server = {
         "name": name,
         "ip": ip,
         "category": category,
         "sni": _read(os.path.join(tmp_dir, f"{idx}.sni")).strip() or None,
-        "status": status,
+        "status": metrics["server"].lower(),
+        "atlasStatus": status,
+        "metrics": metrics,
         "detail": detail.strip(),
         "percent": None,
         "probesOk": None,
@@ -188,13 +229,15 @@ def _summary(servers, excluded):
     infra = [s for s in servers if s["category"] == "infra"]
 
     def count(group, status):
-        return sum(1 for s in group if s["status"] == status)
+        return sum(1 for s in group if s["atlasStatus"] == status)
 
     probes_ok = sum(s["probesOk"] or 0 for s in fleet if s["probesTotal"])
     probes_total = sum(s["probesTotal"] or 0 for s in fleet if s["probesTotal"])
     return {
         "fleet": {
             "total": len(fleet),
+            "serverAvailable": sum(s["status"] == "available" for s in fleet),
+            "suspectedFiltering": sum(s["metrics"]["tspu"] == "SUSPECTED FILTERING" for s in fleet),
             "available": count(fleet, "available"),
             "blocked": count(fleet, "blocked"),
             "skipped": count(fleet, "skipped"),
@@ -204,6 +247,8 @@ def _summary(servers, excluded):
         },
         "infra": {
             "total": len(infra),
+            "serverAvailable": sum(s["status"] == "available" for s in infra),
+            "suspectedFiltering": sum(s["metrics"]["tspu"] == "SUSPECTED FILTERING" for s in infra),
             "available": count(infra, "available"),
             "blocked": count(infra, "blocked"),
             "skipped": count(infra, "skipped"),
@@ -290,6 +335,9 @@ def cmd_check(tmp_dir, out_file, probes_file, asn_file, started, target, ip, sni
 
 def main():
     args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "metrics":
+        print(format_metrics(parse_metrics(_read(args[1]).splitlines())))
+        return 0
     if len(args) == 7 and args[0] == "run":
         cmd_run(*args[1:])
         return 0

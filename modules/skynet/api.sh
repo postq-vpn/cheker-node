@@ -674,7 +674,7 @@ _api_tspu_runs() {
     local body="" f
     for f in ${files[@]+"${files[@]}"}; do
         body+=$(jq -c '{id, startedAt, finishedAt, source, summary,
-                        blocked: [.servers[] | select(.status == "blocked") | .name]}' < "${dir}/${f}" 2>/dev/null)$'\n'
+                        blocked: [.servers[] | select((.atlasStatus // .status) == "blocked") | .name]}' < "${dir}/${f}" 2>/dev/null)$'\n'
     done
     _api_ok "$(jq -sc '{runs: .}' <<< "$body")"
 }
@@ -754,11 +754,6 @@ _api_tspu_check() {
         trap '' HUP
         local tmp_dir; tmp_dir=$(mktemp -d)
         local probes_out; probes_out=$(_skynet_tspu_py probes "$RIPE_API_KEY" 2>/dev/null)
-        if [[ "$probes_out" != OK\ * ]]; then
-            jq -nc --arg t "$target" --arg ip "$ip" --arg sni "$sni" --arg at "$started" --arg e "${probes_out:-нет ответа}" \
-                '{status: "error", target: $t, ip: $ip, sni: $sni, startedAt: $at, message: ("Не удалось собрать выборку зондов RIPE Atlas: " + $e)}' > "$out"
-            rm -rf "$tmp_dir"; exit 0
-        fi
         printf '1\t%s\n' "$ip" > "${tmp_dir}/.targets"
         echo "${target} (${ip})" > "${tmp_dir}/1.name"
         echo "fleet" > "${tmp_dir}/1.category"
