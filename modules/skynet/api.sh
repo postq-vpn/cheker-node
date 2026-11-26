@@ -149,6 +149,18 @@ _api_fleet_list() {
 # Доступность каждого сервера: открыт ли SSH-порт и 443 (VPN/Reality).
 # Как виджет "Флот онлайн" - TCP-соединение без входа, так что не нужен ни
 # ключ, ни пароль, и fail2ban на сервере не тревожится.
+# Открыт ли TCP-порт: до двух попыток по 4 секунды. За 4 секунды ядро шлёт
+# три SYN (0, 1 и 3 с), а у части хостеров первые SYN на 443 пачками теряются:
+# одна трёхсекундная попытка называла такой порт закрытым, хотя клиент,
+# повторив, подключается через секунду-две.
+_api_tcp_open() {
+    local attempt
+    for attempt in 1 2; do
+        timeout 4 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$1" "$2" 2>/dev/null && return 0
+    done
+    return 1
+}
+
 _api_fleet_ping() {
     local tmp_dir; tmp_dir=$(mktemp -d) || { _api_err INTERNAL "mktemp"; return; }
     local n=0 name user ip port key_path sudo_pass category sni
@@ -159,12 +171,12 @@ _api_fleet_ping() {
             (
                 local t0 t1 ssh_ok=false https_ok=false ms=null
                 t0=$(date +%s%N)
-                if timeout 3 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$ip" "${port:-22}" 2>/dev/null; then
+                if _api_tcp_open "$ip" "${port:-22}"; then
                     t1=$(date +%s%N)
                     ssh_ok=true
                     ms=$(( (t1 - t0) / 1000000 ))
                 fi
-                if timeout 3 bash -c 'exec 3<>/dev/tcp/"$1"/443' _ "$ip" 2>/dev/null; then
+                if _api_tcp_open "$ip" 443; then
                     https_ok=true
                 fi
                 printf '{"index":%d,"ssh":%s,"https":%s,"ms":%s}\n' "$n" "$ssh_ok" "$https_ok" "$ms"
