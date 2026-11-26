@@ -876,12 +876,12 @@ _skynet_censorcheck_run_and_report() {
             case "$kind" in
                 AVAILABLE)
                     infra_ok_n=$((infra_ok_n + 1))
-                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
+                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> порог достигнут"$'\n'
                     infra_state_lines+="${infra_bare_name}|AVAILABLE"$'\n'
                     ;;
                 BLOCKED)
                     infra_blocked_n=$((infra_blocked_n + 1))
-                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> не доступен"$'\n'
+                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> ниже порога"$'\n'
                     infra_state_lines+="${infra_bare_name}|BLOCKED"$'\n'
                     local _st st_ok st_tot
                     read -r _st st_ok st_tot < <(grep '^STAT ' "${tmp_dir}/${idx}.result" 2>/dev/null)
@@ -934,7 +934,7 @@ _skynet_censorcheck_run_and_report() {
             # Каждый сервер - отдельной строкой (не через запятую): в городах
             # с несколькими заблокированными серверами список иначе сливался
             # в нечитаемый абзац.
-            city_servers["$city"]+="${short_name} (${pct}%)"$'\n'
+            city_servers["$city"]+="${short_name} — ответ TLS у ${pct}% зондов"$'\n'
             [[ "$asns" != "-" ]] && city_asns["$city"]+="${asns},"
             server_city_hits=$((server_city_hits + 1))
             server_pct_sum=$((server_pct_sum + pct))
@@ -945,12 +945,12 @@ _skynet_censorcheck_run_and_report() {
         if [[ -n "${m_miss:-}" ]]; then
             if [[ "$m_miss" -eq 0 ]]; then
                 mobile_ok_n=$((mobile_ok_n + 1))
-                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
+                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> все зонды получили ответ TLS"$'\n'
             else
                 # Операторов подставим ниже, когда будут загружены их имена:
                 # "@@MOB:<asn,asn>@@" заменяется на " — Билайн".
                 mobile_blocked_n=$((mobile_blocked_n + 1))
-                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> доступно ${m_pct}%@@MOB:${m_asns}@@"$'\n'
+                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> ответ TLS у ${m_pct}% зондов@@MOB:${m_asns}@@"$'\n'
             fi
         fi
 
@@ -961,7 +961,7 @@ _skynet_censorcheck_run_and_report() {
             && (( server_city_hits * 100 >= city_n * ${TSPU_REPLACE_CITY_SHARE:-50} )); then
             local server_avg_pct=$(( server_pct_sum / server_city_hits ))
             if (( server_avg_pct < ${TSPU_REPLACE_AVG_THRESHOLD:-55} )); then
-                replace_list+="• ${short_name} — сред. доступность <b>${server_avg_pct}%</b>, признаки фильтрации в ${server_city_hits} из ${city_n} городов"$'\n'
+                replace_list+="• ${short_name} — ответы TLS в среднем у <b>${server_avg_pct}%</b> зондов, признаки фильтрации в ${server_city_hits} из ${city_n} городов"$'\n'
                 replace_n=$((replace_n + 1))
             fi
         fi
@@ -1110,7 +1110,7 @@ _skynet_censorcheck_run_and_report() {
         elif [[ "$blocked_n" -eq 0 && "$unverified_n" -gt 0 ]]; then
             fleet_level=2; fleet_line="🟡 признаков фильтрации не найдено, не проверено: ${unverified_n}"
         elif [[ "$blocked_n" -eq 0 ]]; then
-            fleet_level=0; fleet_line="🟢 всё чисто"
+            fleet_level=0; fleet_line="🟢 признаков фильтрации не найдено"
         elif (( blocked_n * 100 >= measured * ${TSPU_RED_BLOCKED_SHARE:-50} )); then
             fleet_level=3; fleet_line="🔴 массовые признаки фильтрации (${blocked_n} из ${measured})"
         else
@@ -1126,13 +1126,13 @@ _skynet_censorcheck_run_and_report() {
             infra_level=1; infra_line="⚪ нет данных"
         elif [[ "$infra_blocked_n" -gt 0 ]] \
             && (( infra_blocked_n * 100 >= infra_measured * ${TSPU_INFRA_RED_BLOCKED_SHARE:-1} )); then
-            infra_level=3; infra_line="🔴 недоступно ${infra_blocked_n} из ${infra_measured}"
+            infra_level=3; infra_line="🔴 ниже порога ${infra_blocked_n} из ${infra_measured}"
         elif [[ "$infra_blocked_n" -gt 0 ]]; then
-            infra_level=2; infra_line="🟡 недоступно ${infra_blocked_n} из ${infra_measured}"
+            infra_level=2; infra_line="🟡 ниже порога ${infra_blocked_n} из ${infra_measured}"
         elif [[ "$infra_unverified_n" -gt 0 ]]; then
-            infra_level=2; infra_line="🟡 доступна, не проверено: ${infra_unverified_n}"
+            infra_level=2; infra_line="🟡 порог достигнут у проверенных, без замера: ${infra_unverified_n}"
         else
-            infra_level=0; infra_line="🟢 доступна"
+            infra_level=0; infra_line="🟢 порог достигнут"
         fi
     fi
 
@@ -1151,7 +1151,10 @@ _skynet_censorcheck_run_and_report() {
     if [[ "$worst" -lt 0 || "$has_data" -eq 0 ]]; then
         verdict_emoji="⚪"; verdict_text="нет данных"
     elif [[ "$worst" -eq 0 ]]; then
-        verdict_emoji="🟢"; verdict_text="всё чисто"
+        verdict_emoji="🟢"; verdict_text="признаков фильтрации не найдено"
+    elif [[ "${infra_level:-0}" -gt "${fleet_level:-0}" && "$infra_blocked_n" -gt 0 ]]; then
+        verdict_emoji="🟡"; [[ "$worst" -eq 3 ]] && verdict_emoji="🔴"
+        verdict_text="инфраструктура ниже порога ответов TLS"
     elif [[ "$worst" -eq 3 ]]; then
         verdict_emoji="🔴"; verdict_text="массовые признаки фильтрации"
     elif [[ "$has_blocked" -eq 1 ]]; then
@@ -1169,11 +1172,11 @@ _skynet_censorcheck_run_and_report() {
     # Сводка поднята сразу под заголовок и в НЕразворачиваемой цитате -
     # главное видно без единого клика, детали (кто именно и где) остаются
     # ниже по тем же сворачиваемым блокам, что и раньше.
-    local summary_block="📊 <b>Сводка</b>"$'\n'
+    local summary_block="📊 <b>RIPE Atlas · флот</b>"$'\n'
     if [[ "$fleet_total" -gt 0 ]]; then
         # "Без учёта инфры" явно проговариваем: зонды инфра-серверов сюда не
         # входят (у инфры отдельный вердикт по порогу TSPU_INFRA_OK_THRESHOLD).
-        summary_block+="• Доля зондов с ответом TLS по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
+        summary_block+="• Ответ TLS (сертификат или alert): <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
         summary_block+="• Серверов с признаками фильтрации: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
         if [[ "$city_n" -gt 0 ]]; then
             summary_block+="• Городов с признаками фильтрации: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
@@ -1181,7 +1184,7 @@ _skynet_censorcheck_run_and_report() {
     else
         # Ни одного удавшегося замера: показывать 100% доступности здесь было
         # бы прямой ложью.
-        summary_block+="• Доля зондов с ответом TLS по флоту: <b>нет данных</b>"$'\n'
+        summary_block+="• Ответ TLS (сертификат или alert): <b>нет данных</b>"$'\n'
     fi
     local mobile_measured=$(( mobile_ok_n + mobile_blocked_n ))
     if [[ "$mobile_measured" -gt 0 ]]; then
@@ -1191,7 +1194,7 @@ _skynet_censorcheck_run_and_report() {
     [[ "$excluded_n" -gt 0 ]] && summary_block+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
     if [[ -n "$infra_list" ]]; then
         if [[ "$infra_measured" -gt 0 ]]; then
-            summary_block+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> доступно"
+            summary_block+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> достигли порога ответов TLS"
             [[ "$infra_skip_n" -gt 0 ]] && summary_block+=" (${infra_skip_n} требует проверки)"
             summary_block+=$'\n'
         else
@@ -1202,16 +1205,8 @@ _skynet_censorcheck_run_and_report() {
 
     report+=$'\n'"<blockquote>${summary_block}</blockquote>"$'\n'
 
-    [[ -n "$metric_rows" ]] && report+=$'\n'"${metric_rows}"$'\n'
-    if [[ "${TSPU_LOCAL_RU_VPS:-0}" != 1 || "${TSPU_POSTQ_CHECKER:-0}" != 1 ]]; then
-        local omitted=""
-        [[ "${TSPU_LOCAL_RU_VPS:-0}" != 1 ]] && omitted="TLS с российского VPS"
-        [[ "${TSPU_POSTQ_CHECKER:-0}" != 1 ]] && omitted+="${omitted:+, }VPN из России"
-        report+="<i>Без замера: ${omitted}</i>"$'\n'
-    fi
-
     if [[ -n "$replace_list" ]]; then
-        report+=$'\n'"<blockquote expandable>🔴 <b>Проверить отдельно (${replace_n}):</b>"$'\n'"${replace_list}</blockquote>"$'\n'
+        report+=$'\n'"<blockquote expandable>🔴 <b>RIPE Atlas · проверить отдельно (${replace_n}):</b>"$'\n'"${replace_list}</blockquote>"$'\n'
     fi
 
     # Инфра - отдельным блоком от основного флота: свой список, свой счётчик,
@@ -1248,7 +1243,12 @@ _skynet_censorcheck_run_and_report() {
     # это сигнал с конкретной сети, а не статистика по стране.
     if [[ -n "$mobile_list" ]]; then
         mobile_list="${mobile_list%$'\n'}"
-        report+=$'\n'"<blockquote expandable>📱 <b>Ответы TLS в мобильной сети (${mobile_ok_n} из ${mobile_measured} доступно):</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
+        report+=$'\n'"<blockquote expandable>📱 <b>Мобильные зонды · ответы TLS:</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
+    fi
+
+    [[ -n "$metric_rows" ]] && report+=$'\n'"${metric_rows}"$'\n'
+    if [[ "${TSPU_POSTQ_CHECKER:-0}" != 1 ]]; then
+        report+="<i>Xray Checker (РФ) выключен</i>"$'\n'
     fi
 
     if [[ "$send_tg" -eq 0 ]]; then
@@ -1860,7 +1860,7 @@ _skynet_censorcheck_fleet_thresholds_menu() {
         printf_menu_option "2" "«Под замену»: блокировка минимум в ${C_GREEN}${share}%${C_RESET} городов"
         printf_menu_option "3" "«Под замену»: средняя доступность по ним ниже ${C_GREEN}${avg}%${C_RESET}"
         echo ""
-        printf_description "Строка «Флот» в отчёте: ⚪ нет данных · 🟢 всё чисто ·"
+        printf_description "Строка «Флот» в отчёте: ⚪ нет данных · 🟢 признаков фильтрации не найдено ·"
         printf_description "🟡 есть признаки фильтрации (меньше порога [1]) · 🔴 порог [1] достигнут."
         printf_description "В «Под замену» сервер попадает, только если выполнены [2] и [3] сразу."
         echo ""

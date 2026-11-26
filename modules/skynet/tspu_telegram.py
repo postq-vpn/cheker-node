@@ -17,19 +17,18 @@ def cards(directory):
         counts = Counter(s["metrics"]["vpn"] for s in fleet)
         unknown = len(fleet) - counts["AVAILABLE"] - counts["FAILED"]
         blocks.append("<b>VPN из России · Xray Checker</b>\n"
-                      f"Работает — {counts['AVAILABLE']} · Сбой — {counts['FAILED']}\n"
+                      f"Успешных проверок — {counts['AVAILABLE']} · Сбой — {counts['FAILED']}\n"
                       f"Без свежего результата — {unknown}")
 
     def priority(server):
         m = server["metrics"]
-        if m["vpn"] == "FAILED" or m["tspu"] == "SUSPECTED FILTERING" or m["ruVpsTls"] == "UNAVAILABLE":
-            return 0
-        if server["category"] == "infra":
-            return 3
-        return 1 if m["vpn"] in ("STALE", "UNKNOWN", "SOURCE_ERROR") else 2
+        return ({"blocked": 0, "skipped": 1, "available": 2}[server["atlasStatus"]],
+                m["vpn"] != "FAILED", server["category"] == "infra")
+
+    if servers:
+        blocks.append("<b>Результаты по серверам</b>")
 
     for server in sorted(servers, key=priority):
-        m = server["metrics"]
         title = html.escape(server["name"], quote=False)
         if server["category"] == "infra":
             title += " · инфра"
@@ -37,12 +36,7 @@ def cards(directory):
         heading = f"<b>{title}</b>"
         if address and address != title:
             heading += f"\n<code>{address}</code>"
-        lines = format_metrics(m, fleet=True).splitlines()
-        if m["vpn"] != "NOT_MEASURED":
-            vpn = lines.pop()
-            icon = {"AVAILABLE": "🟢", "FAILED": "🔴"}.get(m["vpn"], "⚪")
-            lines.insert(0, f"{icon} {vpn}")
-        blocks.append(heading + "\n" + "\n".join(lines))
+        blocks.append(heading + "\n" + html.escape(format_metrics(server, fleet=True), quote=False))
     return "\n\n".join(blocks)
 
 

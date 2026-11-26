@@ -32,7 +32,7 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 KEEP_RUNS = 120
 
@@ -168,28 +168,38 @@ def server_metrics(raw_path, lines):
     return metrics
 
 
-def format_metrics(metrics, fleet=False):
-    def percent(key):
-        value = metrics[key]
-        return "нет данных" if value is None else f"{value}%"
-
-    server = "доступен" if metrics["server"] == "AVAILABLE" else "нет данных"
-    filtering = {"NO_SIGNS": "признаков нет", "SUSPECTED FILTERING": "возможна фильтрация"}
-    lines = [f"Сервер — {server} · TCP — {percent('tcpPercent')}",
-             f"TLS через RIPE Atlas — {percent('atlasTlsPercent')}"]
-    vps = metrics["ruVpsTls"]
-    if not fleet or vps != "NOT_MEASURED":
-        result = {"AVAILABLE": "успешно", "UNAVAILABLE": "сбой рукопожатия"}.get(vps, "нет замера")
-        lines.append(f"TLS с российского VPS — {result}")
-    lines.append(f"ТСПУ — {filtering.get(metrics['tspu'], 'нет данных')}")
+def format_metrics(server, fleet=False):
+    metrics = server["metrics"]
+    labels = {"available": "признаков фильтрации нет", "blocked": "возможна фильтрация"}
+    if server["category"] == "infra":
+        labels = {"available": "доля ответов в пределах порога", "blocked": "доля ответов ниже порога"}
+    verdict = labels.get(server["atlasStatus"], "нет результата")
+    lines = [f"RIPE Atlas — {verdict}"]
+    if server["probesTotal"]:
+        lines.append(f"Ответ TLS с учётом перепроверок — {server['probesOk']}/{server['probesTotal']} ({server['percent']}%)")
+    ok, total = metrics["atlasTlsOk"], metrics["atlasTlsTotal"]
+    if total is None:
+        lines.append("RIPE Atlas · TLS — нет данных")
+    elif ok == 0:
+        lines.append(f"⚠️ RIPE Atlas · TLS не подтверждён (0/{total} зондов получили сертификат)")
+    else:
+        lines.append(f"RIPE Atlas · сертификат получили {ok}/{total} зондов ({metrics['atlasTlsPercent']}%)")
     vpn = metrics["vpn"]
     if vpn != "NOT_MEASURED":
-        labels = {"AVAILABLE": "работает", "FAILED": "проверка не прошла",
-                  "SOURCE_ERROR": "нет данных от Checker", "STALE": "замер устарел",
+        labels = {"AVAILABLE": "профиль прошёл проверку", "FAILED": "проверка профиля не прошла",
+                  "SOURCE_ERROR": "нет данных", "STALE": "замер устарел",
                   "NO_PROFILE": "нет профиля", "UNKNOWN": "нет однозначного результата"}
-        lines.append(f"VPN из России — {labels[vpn]}")
+        checker = f"Xray Checker (РФ) — {labels[vpn]}"
+        if metrics.get("vpnCheckedAt"):
+            checked = datetime.fromisoformat(metrics["vpnCheckedAt"])
+            checker += checked.astimezone(timezone(timedelta(hours=3))).strftime(" · %d.%m %H:%M МСК")
+        lines.append(checker)
     elif not fleet:
         lines.append("VPN — требуется отдельный замер")
+    vps = metrics["ruVpsTls"]
+    if not fleet or vps != "NOT_MEASURED":
+        result = {"AVAILABLE": "рукопожатие прошло", "UNAVAILABLE": "соединение не установлено"}.get(vps, "нет замера")
+        lines.append(f"TLS с российского VPS — {result}")
     return "\n".join(lines)
 
 
@@ -390,7 +400,9 @@ def cmd_check(tmp_dir, out_file, probes_file, asn_file, started, target, ip, sni
 def main():
     args = sys.argv[1:]
     if len(args) == 2 and args[0] in ("metrics", "fleet-metrics"):
-        print(format_metrics(server_metrics(args[1], _read(args[1]).splitlines()), fleet=args[0] == "fleet-metrics"))
+        directory, filename = os.path.split(args[1])
+        server = parse_server(directory, os.path.splitext(filename)[0])
+        print(format_metrics(server, fleet=args[0] == "fleet-metrics"))
         return 0
     if len(args) == 7 and args[0] == "run":
         cmd_run(*args[1:])

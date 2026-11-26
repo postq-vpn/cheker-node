@@ -718,7 +718,7 @@ def classify(result):
     результат попадал в "заблокировано" - в выборке RIPE это около 7% от всех
     неуспешных ответов.
     """
-    if "cert" in result:
+    if result.get("cert"):
         return "ok"
     if result.get("alert"):
         return "ok"
@@ -891,22 +891,6 @@ def summarize(meta, results, again_failed, control_ok, again_results=None,
     return lines
 
 
-def _tcp_sample(ip, port, timeout, attempts):
-    for attempt in range(attempts):
-        try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                return 1, attempt + 1
-        except OSError:
-            if attempt < attempts - 1:
-                time.sleep(1)
-
-    return 0, attempts
-
-
-def _port_open(ip, port=443, timeout=5, attempts=3):
-    return bool(_tcp_sample(ip, port, timeout, attempts)[0])
-
-
 def _ru_vps_tls(ip, sni):
     if os.environ.get("TSPU_LOCAL_RU_VPS") != "1":
         return "NOT_MEASURED"
@@ -922,7 +906,7 @@ def _ru_vps_tls(ip, sni):
         return "UNAVAILABLE"
 
 
-def check_fleet(api_key, targets, port_check=True):
+def check_fleet(api_key, targets):
     """Замер всех серверов за один прогон. targets - [(ключ, ip, sni)].
 
     Возвращает {ключ: [строки отчёта]}. Три фазы:
@@ -945,11 +929,7 @@ def check_fleet(api_key, targets, port_check=True):
     out, results = {}, {}
 
     def first_pass(key, ip, sni):
-        local = []
-        if port_check:
-            ok, attempts = _tcp_sample(ip, 443, 5, 3)
-            local.append(f"TCP {ok} {attempts}")
-            local.append(f"RU_TLS {_ru_vps_tls(ip, sni)}")
+        local = [f"RU_TLS {_ru_vps_tls(ip, sni)}"]
         if not ids:
             return key, None, "ERROR NO_PROBES", local
         try:
