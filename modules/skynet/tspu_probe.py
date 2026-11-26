@@ -120,12 +120,13 @@ STRICT_GEO = os.environ.get("TSPU_PROBE_STRICT_GEO", "0") == "1"
 # зонд американского хостера.
 EXCLUDE_TAGS = {"datacentre", "datacenter"}
 
-# Зонды на серверах, которые сидят в абонентской сети оператора и потому
+# Исключения по ID. В том числе зонды на серверах, которые сидят в абонентской сети оператора и потому
 # проходят фильтр по ASN, но абонентом не являются. Тег datacentre им не
 # поставили, а исключать все программные зонды (system-software) нельзя -
 # так ставят зонд и дома (docker, lxc), и выборка теряет Екатеринбург и Омск.
 # Свои добавляются через TSPU_EXCLUDE_PROBES (ID через запятую).
 EXCLUDE_PROBES = {
+    35403,    # Home Internet (AS42893), Санкт-Петербург
     1001553,  # kolo.server66.ru - Дом.ру Урал (AS5563), Екатеринбург
     1001488,  # sera.server66.ru - Инсис (AS28890), Екатеринбург
 }
@@ -518,6 +519,7 @@ def load_cache(force=False):
                           and cached.get("strict_geo") == STRICT_GEO
                           and cached.get("consumer_only") == CONSUMER_ONLY
                           and cached.get("asn_set") == sorted(CONSUMER_ASNS)
+                          and cached.get("excluded_probes") == sorted(EXCLUDE_PROBES)
                           and cached.get("mobile") == MOBILE_PROBES)
             if fresh and same_shape and cached.get("probes"):
                 return cached
@@ -545,6 +547,7 @@ def load_cache(force=False):
         "strict_geo": STRICT_GEO,
         "consumer_only": CONSUMER_ONLY,
         "asn_set": sorted(CONSUMER_ASNS),
+        "excluded_probes": sorted(EXCLUDE_PROBES),
         "mobile": MOBILE_PROBES,
         "probes": probes,
         "asn_names": names,
