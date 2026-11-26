@@ -29,6 +29,7 @@
 
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -129,14 +130,67 @@ def parse_metrics(lines):
     return metrics
 
 
-def format_metrics(metrics):
+def vpn_observation(snapshot, hosts):
+    try:
+        data = json.loads(snapshot)
+        if not isinstance(data, dict) or not isinstance(data.get("servers"), list):
+            return {"vpn": "SOURCE_ERROR"}
+        checked = datetime.fromisoformat(data["checkedAt"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - checked).total_seconds()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {"vpn": "SOURCE_ERROR"}
+
+    names = {host.lower().rstrip(".") for host in hosts}
+    matches = []
+    for row in data["servers"]:
+        if not isinstance(row, dict):
+            return {"vpn": "SOURCE_ERROR"}
+        sub = row.get("subdomain")
+        if isinstance(sub, str) and re.fullmatch(r"[a-z0-9-]+", sub):
+            if f"{sub}.postq.space" in names:
+                matches.append(row)
+    if not matches:
+        return {"vpn": "NO_PROFILE"}
+    if len(matches) != 1 or type(matches[0].get("alive")) is not bool:
+        return {"vpn": "UNKNOWN"}
+    status = "AVAILABLE" if matches[0]["alive"] else "FAILED"
+    return {"vpn": status if 0 <= age <= 900 else "STALE",
+            "vpnCheckedAt": checked.isoformat(), "vpnProfile": matches[0]["subdomain"]}
+
+
+def server_metrics(raw_path, lines):
+    metrics = parse_metrics(lines)
+    snapshot_path = os.path.join(os.path.dirname(raw_path), ".vpn-status")
+    if os.path.exists(snapshot_path):
+        label = _read(os.path.splitext(raw_path)[0] + ".name").strip()
+        name, _, address = label.rpartition(" (")
+        metrics.update(vpn_observation(_read(snapshot_path), [name, address.rstrip(")")]))
+    return metrics
+
+
+def format_metrics(metrics, fleet=False):
     def percent(key):
         value = metrics[key]
         return "нет данных" if value is None else f"{value}%"
 
-    return (f"Сервер {metrics['server']} · TCP {percent('tcpPercent')} · "
-            f"TLS Atlas {percent('atlasTlsPercent')} · TLS RU VPS {metrics['ruVpsTls']} · "
-            f"ТСПУ {metrics['tspu']} · VPN требуется отдельный замер")
+    server = "доступен" if metrics["server"] == "AVAILABLE" else "нет данных"
+    filtering = {"NO_SIGNS": "признаков нет", "SUSPECTED FILTERING": "возможна фильтрация"}
+    lines = [f"Сервер — {server} · TCP — {percent('tcpPercent')}",
+             f"TLS через RIPE Atlas — {percent('atlasTlsPercent')}"]
+    vps = metrics["ruVpsTls"]
+    if not fleet or vps != "NOT_MEASURED":
+        result = {"AVAILABLE": "успешно", "UNAVAILABLE": "сбой рукопожатия"}.get(vps, "нет замера")
+        lines.append(f"TLS с российского VPS — {result}")
+    lines.append(f"ТСПУ — {filtering.get(metrics['tspu'], 'нет данных')}")
+    vpn = metrics["vpn"]
+    if vpn != "NOT_MEASURED":
+        labels = {"AVAILABLE": "работает", "FAILED": "проверка не прошла",
+                  "SOURCE_ERROR": "нет данных от Checker", "STALE": "замер устарел",
+                  "NO_PROFILE": "нет профиля", "UNKNOWN": "нет однозначного результата"}
+        lines.append(f"VPN из России — {labels[vpn]}")
+    elif not fleet:
+        lines.append("VPN — требуется отдельный замер")
+    return "\n".join(lines)
 
 
 def parse_server(tmp_dir, idx):
@@ -154,7 +208,7 @@ def parse_server(tmp_dir, idx):
     kind, _, detail = head.partition(" ")
     status = {"AVAILABLE": "available", "BLOCKED": "blocked"}.get(kind, "skipped")
 
-    metrics = parse_metrics(raw_lines)
+    metrics = server_metrics(os.path.join(tmp_dir, f"{idx}.out"), raw_lines)
     server = {
         "name": name,
         "ip": ip,
@@ -335,8 +389,8 @@ def cmd_check(tmp_dir, out_file, probes_file, asn_file, started, target, ip, sni
 
 def main():
     args = sys.argv[1:]
-    if len(args) == 2 and args[0] == "metrics":
-        print(format_metrics(parse_metrics(_read(args[1]).splitlines())))
+    if len(args) == 2 and args[0] in ("metrics", "fleet-metrics"):
+        print(format_metrics(server_metrics(args[1], _read(args[1]).splitlines()), fleet=args[0] == "fleet-metrics"))
         return 0
     if len(args) == 7 and args[0] == "run":
         cmd_run(*args[1:])

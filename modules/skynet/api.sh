@@ -759,6 +759,7 @@ _api_tspu_check() {
         echo "fleet" > "${tmp_dir}/1.category"
         echo 1 > "${tmp_dir}/.count"
         _skynet_tspu_py fleet "$RIPE_API_KEY" "$sni" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
+        _skynet_tspu_fetch_vpn_status "$tmp_dir"
         _skynet_tspu_summarize_server "$tmp_dir" 1 > "${tmp_dir}/1.result"
         printf '%s\n' "$probes_out" > "${tmp_dir}/.probes"
         _skynet_tspu_asn_names_file "${tmp_dir}/.asnnames"

@@ -42,6 +42,7 @@ _TSPU_INFRA_STATE_FILE="/etc/reshala/tspu_infra.state"
 # заменяет и от этого не зависит.
 _TSPU_STORE_DIR="/etc/reshala/tspu"
 _TSPU_STORE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_store.py"
+_TSPU_TELEGRAM_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_telegram.py"
 
 # Один прогон флота за раз: cron, меню и `reshala api tspu run` берут один и
 # тот же замок. Два прогона подряд - это двойная цена в кредитах RIPE Atlas
@@ -256,52 +257,16 @@ _skynet_censorcheck_tg_send_chunk() {
     printf '%s' "$http_code"
 }
 
-# Отправляет произвольно длинный текст, разбивая его на несколько
-# сообщений по границам строк, если он не влезает в лимит Telegram.
-# Возвращает 0, если ВСЕ куски доставлены успешно.
-#
-# Резать разрешено только СНАРУЖИ <blockquote>: разрез посреди открытого
-# тега отправляет Telegram половину пары ("Can't find end tag..." /
-# "Unexpected end tag...") и валит ВЕСЬ кусок, а не только форматирование.
-# Поэтому пока открыт хотя бы один blockquote, чанк копится дальше,
-# даже за счёт max_len - overshoot на один блок безопаснее гарантированно
-# битого HTML.
+# Скрипт сохраняет HTML-разметку при переносе цитат между сообщениями.
 _skynet_censorcheck_tg_send() {
-    local full_text="$1"
-    local token="${TG_BOT_TOKEN:-}"
-    local chat_id="${TG_CHAT_ID:-}"
-
-    if [[ -z "$token" || -z "$chat_id" ]]; then
-        return 1
-    fi
-
-    local max_len=3500
-    local chunk="" all_ok=0 http_code
-    local depth=0 line
-
-    # "< <(printf ...)", а не "<<< "$full_text"": here-string дописывает свой
-    # собственный "\n" в конец, а $full_text и так уже кончается на "\n" -
-    # на выходе лишняя пустая "строка", которая при многочастевой отправке
-    # улетает Telegram отдельным пустым сообщением ("text must be non-empty").
-    while IFS= read -r line; do
-        if (( depth == 0 )) && (( ${#chunk} + ${#line} + 1 > max_len )) && [[ -n "$chunk" ]]; then
-            http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
-            [[ "$http_code" != "200" ]] && all_ok=1
-            chunk=""
-        fi
-        chunk+="${line}"$'\n'
-
-        case "$line" in *'</blockquote>'*) depth=$((depth - 1)) ;; esac
-        case "$line" in *'<blockquote'*) depth=$((depth + 1)) ;; esac
-        (( depth < 0 )) && depth=0
-    done < <(printf '%s' "$full_text")
-
-    if [[ -n "$chunk" ]]; then
+    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 1
+    local chunk http_code sent=0 failed=0
+    while IFS= read -r -d '' chunk; do
         http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
-        [[ "$http_code" != "200" ]] && all_ok=1
-    fi
-
-    return "$all_ok"
+        [[ "$http_code" == 200 ]] || failed=1
+        sent=1
+    done < <(printf '%s' "$1" | python3 "$_TSPU_TELEGRAM_SCRIPT" chunks)
+    [[ "$sent" == 1 && "$failed" == 0 ]]
 }
 
 _skynet_censorcheck_configure_telegram() {
@@ -616,6 +581,12 @@ _skynet_tspu_summarize_server() {
 # один контрольный замер на прогон, перепроверка только промахнувшихся
 # зондов. Раньше здесь был питон на каждый сервер одновременно - ~25 МБ
 # памяти на сервер и контроль, повторённый N раз.
+_skynet_tspu_fetch_vpn_status() {
+    [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] || return 0
+    # Пустой файл означает, что запрос выполнялся, но источник недоступен.
+    curl -fsS --max-time 8 https://status.postq.space/api/status > "$1/.vpn-status" 2>/dev/null || :
+}
+
 _skynet_tspu_check_fleet_parallel() {
     local api_key="$1"
     local tmp_dir; tmp_dir=$(mktemp -d)
@@ -661,6 +632,7 @@ _skynet_tspu_check_fleet_parallel() {
         _skynet_tspu_py fleet "$api_key" "" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
     fi
 
+    _skynet_tspu_fetch_vpn_status "$tmp_dir"
     echo "$i" > "${tmp_dir}/.count"
 
     local idx idx_category
@@ -833,7 +805,7 @@ _skynet_censorcheck_run_and_report() {
 
     # Все три группы - одинаковый вид: сворачиваемая (expandable) цитата
     # с заголовком-счётчиком, внутри - КАЖДЫЙ сервер отдельной строкой.
-    local ok_list="" fail_list="" skip_list=""
+    local fail_list="" skip_list=""
     local total=0 ok_n=0 blocked_n=0 skip_n=0 idx name result kind detail esc_name category
 
     # Инфра (категория "infra") идёт отдельным блоком от основного флота -
@@ -871,7 +843,7 @@ _skynet_censorcheck_run_and_report() {
 
     # Зонды всего флота в одной куче: доступность по флоту это доля дошедших
     # зондов, а не среднее из процентов серверов - у тех разные знаменатели.
-    local metric_rows="" metrics
+    local metric_rows
     local fleet_ok=0 fleet_total=0
 
     for ((idx = 1; idx <= count; idx++)); do
@@ -884,9 +856,6 @@ _skynet_censorcheck_run_and_report() {
         detail="${result#* }"
         [[ "$detail" == "$result" ]] && detail=""
         detail=$(_skynet_censorcheck_html_escape "$detail")
-
-        metrics=$(python3 "$_TSPU_STORE_SCRIPT" metrics "${tmp_dir}/${idx}.out")
-        metric_rows+="• <b>${esc_name}</b> — ${metrics}"$'\n'
 
         raw_head=$(head -1 "${tmp_dir}/${idx}.out" 2>/dev/null)
         if [[ "$raw_head" == ERROR* ]]; then
@@ -934,7 +903,6 @@ _skynet_censorcheck_run_and_report() {
                 # Деталь у доступного сервера появляется только когда есть что
                 # сказать: одиночный промах или неполный набор замеров.
                 ok_n=$((ok_n + 1))
-                ok_list+="• ${esc_name}${detail:+ — ${detail}}"$'\n'
                 ;;
             BLOCKED)
                 blocked_n=$((blocked_n + 1))
@@ -1019,6 +987,11 @@ _skynet_censorcheck_run_and_report() {
     [[ "$verbose" -eq 1 ]] && run_source="menu"
     _skynet_tspu_store_run "$tmp_dir" "$probes_out" "$started_at" "$run_source"
 
+    metric_rows=$(python3 "$_TSPU_TELEGRAM_SCRIPT" cards "$tmp_dir") || {
+        log "CensorCheck: не удалось сформировать карточки Telegram."
+        rm -rf "$tmp_dir"
+        return 1
+    }
     rm -rf "$tmp_dir"
 
     # Номера ASN в имена операторов: свои переводы для крупных операторов,
@@ -1229,14 +1202,16 @@ _skynet_censorcheck_run_and_report() {
 
     report+=$'\n'"<blockquote>${summary_block}</blockquote>"$'\n'
 
-    report+=$'\n'"<b>Показатели по серверам</b>"$'\n'"${metric_rows}"
+    [[ -n "$metric_rows" ]] && report+=$'\n'"${metric_rows}"$'\n'
+    if [[ "${TSPU_LOCAL_RU_VPS:-0}" != 1 || "${TSPU_POSTQ_CHECKER:-0}" != 1 ]]; then
+        local omitted=""
+        [[ "${TSPU_LOCAL_RU_VPS:-0}" != 1 ]] && omitted="TLS с российского VPS"
+        [[ "${TSPU_POSTQ_CHECKER:-0}" != 1 ]] && omitted+="${omitted:+, }VPN из России"
+        report+="<i>Без замера: ${omitted}</i>"$'\n'
+    fi
 
     if [[ -n "$replace_list" ]]; then
         report+=$'\n'"<blockquote expandable>🔴 <b>Проверить отдельно (${replace_n}):</b>"$'\n'"${replace_list}</blockquote>"$'\n'
-    fi
-
-    if [[ -n "$ok_list" ]]; then
-        report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Без признаков фильтрации (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
     fi
 
     # Инфра - отдельным блоком от основного флота: свой список, свой счётчик,
@@ -1376,6 +1351,8 @@ _skynet_censorcheck_check_address() {
     local tmp_dir; tmp_dir=$(mktemp -d)
     printf '1\t%s\n' "$ip" > "${tmp_dir}/.targets"
     _skynet_tspu_py fleet "$RIPE_API_KEY" "$sni" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
+    printf '%s (%s)\n' "$target" "$ip" > "${tmp_dir}/1.name"
+    _skynet_tspu_fetch_vpn_status "$tmp_dir"
     _skynet_tspu_summarize_server "$tmp_dir" 1 > "${tmp_dir}/1.result"
 
     local -A asn_titles=()
@@ -2037,6 +2014,12 @@ _skynet_censorcheck_menu() {
 
         printf_menu_option "n" "Настроить TG_BOT_TOKEN / TG_CHAT_ID"
         printf_menu_option "k" "Настроить RIPE Atlas API-ключ / SNI"
+        local checker_action="Включить"
+        [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] && checker_action="Выключить"
+        printf_menu_option "x" "${checker_action} VPN-замер из России (status.postq.space)"
+        local vps_action="Включить"
+        [[ "${TSPU_LOCAL_RU_VPS:-0}" == 1 ]] && vps_action="Выключить"
+        printf_menu_option "v" "${vps_action} TLS-замер с этого сервера (российский VPS)"
         printf_menu_option "g" "Режим проверки, выборка зондов и цена прогона"
         printf_menu_option "s" "Серверы в проверке (включить/исключить)"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
@@ -2052,6 +2035,29 @@ _skynet_censorcheck_menu() {
         case "$choice" in
             [nN]) _skynet_censorcheck_configure_telegram ;;
             [kK]) _skynet_censorcheck_configure_ripe ;;
+            [xX])
+                local checker_enabled=1
+                [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] && checker_enabled=0
+                if set_config_var TSPU_POSTQ_CHECKER "$checker_enabled"; then
+                    TSPU_POSTQ_CHECKER="$checker_enabled"
+                else
+                    printf_error "Не удалось сохранить настройку."
+                    wait_for_enter
+                fi
+                ;;
+            [vV])
+                local enabled=0
+                if [[ "${TSPU_LOCAL_RU_VPS:-0}" != 1 ]]; then
+                    ask_yes_no "Этот сервер находится в России и будет выполнять TLS-замеры?" "n" || continue
+                    enabled=1
+                fi
+                if set_config_var TSPU_LOCAL_RU_VPS "$enabled"; then
+                    TSPU_LOCAL_RU_VPS="$enabled"
+                else
+                    printf_error "Не удалось сохранить настройку."
+                    wait_for_enter
+                fi
+                ;;
             [gG]) _skynet_censorcheck_probe_set_menu ;;
             [sS]) _skynet_censorcheck_servers_menu ;;
             [eE]) _skynet_censorcheck_schedule_menu ;;
