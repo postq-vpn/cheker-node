@@ -42,7 +42,6 @@ _TSPU_INFRA_STATE_FILE="/etc/reshala/tspu_infra.state"
 # заменяет и от этого не зависит.
 _TSPU_STORE_DIR="/etc/reshala/tspu"
 _TSPU_STORE_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_store.py"
-_TSPU_TELEGRAM_SCRIPT="${SCRIPT_DIR}/modules/skynet/tspu_telegram.py"
 
 # Один прогон флота за раз: cron, меню и `reshala api tspu run` берут один и
 # тот же замок. Два прогона подряд - это двойная цена в кредитах RIPE Atlas
@@ -257,16 +256,52 @@ _skynet_censorcheck_tg_send_chunk() {
     printf '%s' "$http_code"
 }
 
-# Скрипт сохраняет HTML-разметку при переносе цитат между сообщениями.
+# Отправляет произвольно длинный текст, разбивая его на несколько
+# сообщений по границам строк, если он не влезает в лимит Telegram.
+# Возвращает 0, если ВСЕ куски доставлены успешно.
+#
+# Резать разрешено только СНАРУЖИ <blockquote>: разрез посреди открытого
+# тега отправляет Telegram половину пары ("Can't find end tag..." /
+# "Unexpected end tag...") и валит ВЕСЬ кусок, а не только форматирование.
+# Поэтому пока открыт хотя бы один blockquote, чанк копится дальше,
+# даже за счёт max_len - overshoot на один блок безопаснее гарантированно
+# битого HTML.
 _skynet_censorcheck_tg_send() {
-    [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]] || return 1
-    local chunk http_code sent=0 failed=0
-    while IFS= read -r -d '' chunk; do
+    local full_text="$1"
+    local token="${TG_BOT_TOKEN:-}"
+    local chat_id="${TG_CHAT_ID:-}"
+
+    if [[ -z "$token" || -z "$chat_id" ]]; then
+        return 1
+    fi
+
+    local max_len=3500
+    local chunk="" all_ok=0 http_code
+    local depth=0 line
+
+    # "< <(printf ...)", а не "<<< "$full_text"": here-string дописывает свой
+    # собственный "\n" в конец, а $full_text и так уже кончается на "\n" -
+    # на выходе лишняя пустая "строка", которая при многочастевой отправке
+    # улетает Telegram отдельным пустым сообщением ("text must be non-empty").
+    while IFS= read -r line; do
+        if (( depth == 0 )) && (( ${#chunk} + ${#line} + 1 > max_len )) && [[ -n "$chunk" ]]; then
+            http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
+            [[ "$http_code" != "200" ]] && all_ok=1
+            chunk=""
+        fi
+        chunk+="${line}"$'\n'
+
+        case "$line" in *'</blockquote>'*) depth=$((depth - 1)) ;; esac
+        case "$line" in *'<blockquote'*) depth=$((depth + 1)) ;; esac
+        (( depth < 0 )) && depth=0
+    done < <(printf '%s' "$full_text")
+
+    if [[ -n "$chunk" ]]; then
         http_code=$(_skynet_censorcheck_tg_send_chunk "$chunk")
-        [[ "$http_code" == 200 ]] || failed=1
-        sent=1
-    done < <(printf '%s' "$1" | python3 "$_TSPU_TELEGRAM_SCRIPT" chunks)
-    [[ "$sent" == 1 && "$failed" == 0 ]]
+        [[ "$http_code" != "200" ]] && all_ok=1
+    fi
+
+    return "$all_ok"
 }
 
 _skynet_censorcheck_configure_telegram() {
@@ -401,7 +436,6 @@ _skynet_tspu_py() {
     TSPU_MOBILE_PROBES="${TSPU_MOBILE_PROBES:-1}" \
     TSPU_CONTROL_IP="${TSPU_CONTROL_IP:-}" \
     TSPU_CONTROL_SNI="${TSPU_CONTROL_SNI:-}" \
-    TSPU_LOCAL_RU_VPS="${TSPU_LOCAL_RU_VPS:-0}" \
     TSPU_PARALLEL="${TSPU_PARALLEL:-10}" \
     python3 "$_TSPU_PROBE_SCRIPT" "$@"
 }
@@ -477,7 +511,7 @@ _skynet_tspu_summarize_server() {
         NOPORT)
             # Без реально слушающего 443 RIPE Atlas показал бы "заблокировано"
             # для всех зондов - но это не ТСПУ, а отсутствие VPN на сервере.
-            echo "SKIP нет TCP-ответа на порту 443 с узла проверки"
+            echo "SKIP порт 443 не отвечает (нет VPN/Reality на сервере или сервер недоступен)"
             return
             ;;
         ERROR*)
@@ -517,7 +551,7 @@ _skynet_tspu_summarize_server() {
         if [[ "$percent" -ge "${TSPU_INFRA_OK_THRESHOLD:-60}" ]]; then
             echo "AVAILABLE"
         else
-            echo "BLOCKED доля ответов TLS ниже порога"
+            echo "BLOCKED недоступен"
         fi
         echo "STAT ${success} ${total}"
         return
@@ -540,7 +574,7 @@ _skynet_tspu_summarize_server() {
     if [[ "$blocked" -eq 0 ]]; then
         echo "AVAILABLE${note:+ ${note# · }}"
     else
-        echo "BLOCKED ответы TLS у ${percent}% (${success}/${total})${note}"
+        echo "BLOCKED доступно ${percent}% (${success}/${total})${note}"
     fi
 
     # Машиночитаемая строка для сводки по флоту: складывать проценты серверов
@@ -567,6 +601,12 @@ _skynet_tspu_summarize_server() {
     fi
 }
 
+_skynet_tspu_fetch_vpn_status() {
+    [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] || return 0
+    # Пустой файл означает, что запрос выполнялся, но источник недоступен.
+    curl -fsS --max-time 8 https://status.postq.space/api/status > "$1/.vpn-status" 2>/dev/null || :
+}
+
 # Прогоняет весь флот (без SSH, напрямую по IP из базы флота). Результаты -
 # в файлах внутри временной директории, путь к которой печатает в stdout:
 #   <tmp_dir>/N.name    - "Имя (IP)"
@@ -581,12 +621,6 @@ _skynet_tspu_summarize_server() {
 # один контрольный замер на прогон, перепроверка только промахнувшихся
 # зондов. Раньше здесь был питон на каждый сервер одновременно - ~25 МБ
 # памяти на сервер и контроль, повторённый N раз.
-_skynet_tspu_fetch_vpn_status() {
-    [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] || return 0
-    # Пустой файл означает, что запрос выполнялся, но источник недоступен.
-    curl -fsS --max-time 8 https://status.postq.space/api/status > "$1/.vpn-status" 2>/dev/null || :
-}
-
 _skynet_tspu_check_fleet_parallel() {
     local api_key="$1"
     local tmp_dir; tmp_dir=$(mktemp -d)
@@ -762,8 +796,9 @@ _skynet_censorcheck_run_and_report() {
         probes_out=$(_skynet_tspu_py probes "$RIPE_API_KEY" 2>/dev/null)
     fi
     if [[ "$probes_out" != OK\ * ]]; then
-        log "CensorCheck: ошибка выборки Atlas (${probes_out:-нет ответа}), продолжаю проверку."
-        probes_out="OK 0 0"
+        [[ "$verbose" -eq 1 ]] && printf_error "Не удалось собрать выборку зондов RIPE Atlas (${probes_out:-нет ответа})."
+        log "CensorCheck: не удалось собрать выборку зондов (${probes_out:-нет ответа})."
+        return 1
     fi
 
     local _p probe_n city_n
@@ -805,7 +840,7 @@ _skynet_censorcheck_run_and_report() {
 
     # Все три группы - одинаковый вид: сворачиваемая (expandable) цитата
     # с заголовком-счётчиком, внутри - КАЖДЫЙ сервер отдельной строкой.
-    local fail_list="" skip_list=""
+    local ok_list="" fail_list="" skip_list=""
     local total=0 ok_n=0 blocked_n=0 skip_n=0 idx name result kind detail esc_name category
 
     # Инфра (категория "infra") идёт отдельным блоком от основного флота -
@@ -843,7 +878,6 @@ _skynet_censorcheck_run_and_report() {
 
     # Зонды всего флота в одной куче: доступность по флоту это доля дошедших
     # зондов, а не среднее из процентов серверов - у тех разные знаменатели.
-    local metric_rows
     local fleet_ok=0 fleet_total=0
 
     for ((idx = 1; idx <= count; idx++)); do
@@ -876,12 +910,12 @@ _skynet_censorcheck_run_and_report() {
             case "$kind" in
                 AVAILABLE)
                     infra_ok_n=$((infra_ok_n + 1))
-                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> порог достигнут"$'\n'
+                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
                     infra_state_lines+="${infra_bare_name}|AVAILABLE"$'\n'
                     ;;
                 BLOCKED)
                     infra_blocked_n=$((infra_blocked_n + 1))
-                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> ниже порога"$'\n'
+                    infra_list+="• ${esc_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> не доступен"$'\n'
                     infra_state_lines+="${infra_bare_name}|BLOCKED"$'\n'
                     local _st st_ok st_tot
                     read -r _st st_ok st_tot < <(grep '^STAT ' "${tmp_dir}/${idx}.result" 2>/dev/null)
@@ -903,6 +937,7 @@ _skynet_censorcheck_run_and_report() {
                 # Деталь у доступного сервера появляется только когда есть что
                 # сказать: одиночный промах или неполный набор замеров.
                 ok_n=$((ok_n + 1))
+                ok_list+="• ${esc_name}${detail:+ — ${detail}}"$'\n'
                 ;;
             BLOCKED)
                 blocked_n=$((blocked_n + 1))
@@ -934,7 +969,7 @@ _skynet_censorcheck_run_and_report() {
             # Каждый сервер - отдельной строкой (не через запятую): в городах
             # с несколькими заблокированными серверами список иначе сливался
             # в нечитаемый абзац.
-            city_servers["$city"]+="${short_name} — ответ TLS у ${pct}% зондов"$'\n'
+            city_servers["$city"]+="${short_name} (${pct}%)"$'\n'
             [[ "$asns" != "-" ]] && city_asns["$city"]+="${asns},"
             server_city_hits=$((server_city_hits + 1))
             server_pct_sum=$((server_pct_sum + pct))
@@ -945,12 +980,12 @@ _skynet_censorcheck_run_and_report() {
         if [[ -n "${m_miss:-}" ]]; then
             if [[ "$m_miss" -eq 0 ]]; then
                 mobile_ok_n=$((mobile_ok_n + 1))
-                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> все зонды получили ответ TLS"$'\n'
+                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> доступен"$'\n'
             else
                 # Операторов подставим ниже, когда будут загружены их имена:
                 # "@@MOB:<asn,asn>@@" заменяется на " — Билайн".
                 mobile_blocked_n=$((mobile_blocked_n + 1))
-                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> ответ TLS у ${m_pct}% зондов@@MOB:${m_asns}@@"$'\n'
+                mobile_list+="• ${short_name} — <tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> доступно ${m_pct}%@@MOB:${m_asns}@@"$'\n'
             fi
         fi
 
@@ -961,7 +996,7 @@ _skynet_censorcheck_run_and_report() {
             && (( server_city_hits * 100 >= city_n * ${TSPU_REPLACE_CITY_SHARE:-50} )); then
             local server_avg_pct=$(( server_pct_sum / server_city_hits ))
             if (( server_avg_pct < ${TSPU_REPLACE_AVG_THRESHOLD:-55} )); then
-                replace_list+="• ${short_name} — ответы TLS в среднем у <b>${server_avg_pct}%</b> зондов, признаки фильтрации в ${server_city_hits} из ${city_n} городов"$'\n'
+                replace_list+="• ${short_name} — сред. доступность <b>${server_avg_pct}%</b>, блокировка в ${server_city_hits} из ${city_n} городов"$'\n'
                 replace_n=$((replace_n + 1))
             fi
         fi
@@ -982,16 +1017,16 @@ _skynet_censorcheck_run_and_report() {
         done < "${tmp_dir}/.excluded"
     fi
 
+    local checker_report=""
+    if [[ -f "$tmp_dir/.vpn-status" ]]; then
+        checker_report=$(python3 "$_TSPU_STORE_SCRIPT" checker-report "$tmp_dir")
+    fi
+
     local run_source="cron"
     [[ "$mode" == "--api" ]] && run_source="panel"
     [[ "$verbose" -eq 1 ]] && run_source="menu"
     _skynet_tspu_store_run "$tmp_dir" "$probes_out" "$started_at" "$run_source"
 
-    metric_rows=$(python3 "$_TSPU_TELEGRAM_SCRIPT" cards "$tmp_dir") || {
-        log "CensorCheck: не удалось сформировать карточки Telegram."
-        rm -rf "$tmp_dir"
-        return 1
-    }
     rm -rf "$tmp_dir"
 
     # Номера ASN в имена операторов: свои переводы для крупных операторов,
@@ -1108,13 +1143,13 @@ _skynet_censorcheck_run_and_report() {
         if [[ "$measured" -eq 0 ]]; then
             fleet_level=1; fleet_line="⚪ нет данных"
         elif [[ "$blocked_n" -eq 0 && "$unverified_n" -gt 0 ]]; then
-            fleet_level=2; fleet_line="🟡 признаков фильтрации не найдено, не проверено: ${unverified_n}"
+            fleet_level=2; fleet_line="🟡 блокировок не найдено, не проверено: ${unverified_n}"
         elif [[ "$blocked_n" -eq 0 ]]; then
-            fleet_level=0; fleet_line="🟢 признаков фильтрации не найдено"
+            fleet_level=0; fleet_line="🟢 всё чисто"
         elif (( blocked_n * 100 >= measured * ${TSPU_RED_BLOCKED_SHARE:-50} )); then
-            fleet_level=3; fleet_line="🔴 массовые признаки фильтрации (${blocked_n} из ${measured})"
+            fleet_level=3; fleet_line="🔴 серьёзные блокировки (${blocked_n} из ${measured})"
         else
-            fleet_level=2; fleet_line="🟡 есть признаки фильтрации (${blocked_n} из ${measured})"
+            fleet_level=2; fleet_line="🟡 есть блокировки (${blocked_n} из ${measured})"
         fi
     fi
 
@@ -1126,13 +1161,13 @@ _skynet_censorcheck_run_and_report() {
             infra_level=1; infra_line="⚪ нет данных"
         elif [[ "$infra_blocked_n" -gt 0 ]] \
             && (( infra_blocked_n * 100 >= infra_measured * ${TSPU_INFRA_RED_BLOCKED_SHARE:-1} )); then
-            infra_level=3; infra_line="🔴 ниже порога ${infra_blocked_n} из ${infra_measured}"
+            infra_level=3; infra_line="🔴 недоступно ${infra_blocked_n} из ${infra_measured}"
         elif [[ "$infra_blocked_n" -gt 0 ]]; then
-            infra_level=2; infra_line="🟡 ниже порога ${infra_blocked_n} из ${infra_measured}"
+            infra_level=2; infra_line="🟡 недоступно ${infra_blocked_n} из ${infra_measured}"
         elif [[ "$infra_unverified_n" -gt 0 ]]; then
-            infra_level=2; infra_line="🟡 порог достигнут у проверенных, без замера: ${infra_unverified_n}"
+            infra_level=2; infra_line="🟡 доступна, не проверено: ${infra_unverified_n}"
         else
-            infra_level=0; infra_line="🟢 порог достигнут"
+            infra_level=0; infra_line="🟢 доступна"
         fi
     fi
 
@@ -1151,50 +1186,47 @@ _skynet_censorcheck_run_and_report() {
     if [[ "$worst" -lt 0 || "$has_data" -eq 0 ]]; then
         verdict_emoji="⚪"; verdict_text="нет данных"
     elif [[ "$worst" -eq 0 ]]; then
-        verdict_emoji="🟢"; verdict_text="признаков фильтрации не найдено"
-    elif [[ "${infra_level:-0}" -gt "${fleet_level:-0}" && "$infra_blocked_n" -gt 0 ]]; then
-        verdict_emoji="🟡"; [[ "$worst" -eq 3 ]] && verdict_emoji="🔴"
-        verdict_text="инфраструктура ниже порога ответов TLS"
+        verdict_emoji="🟢"; verdict_text="всё чисто"
     elif [[ "$worst" -eq 3 ]]; then
-        verdict_emoji="🔴"; verdict_text="массовые признаки фильтрации"
+        verdict_emoji="🔴"; verdict_text="серьёзные блокировки"
     elif [[ "$has_blocked" -eq 1 ]]; then
-        verdict_emoji="🟡"; verdict_text="есть признаки фильтрации"
+        verdict_emoji="🟡"; verdict_text="есть блокировки"
     else
-        verdict_emoji="🟡"; verdict_text="признаков фильтрации не найдено, не всё проверено"
+        verdict_emoji="🟡"; verdict_text="блокировок не найдено, не всё проверено"
     fi
 
-    local report="${verdict_emoji} <b>Проверка ТСПУ через RIPE Atlas — ${verdict_text}</b>"$'\n\n'
+    local report="${verdict_emoji} <b>Блокировка ТСПУ — ${verdict_text}</b>"$'\n\n'
     [[ -n "$fleet_line" ]] && report+="🖥 Флот: ${fleet_line}"$'\n'
-    [[ -n "$infra_line" ]] && report+="🧩 Инфра по ответам TLS: ${infra_line}"$'\n'
+    [[ -n "$infra_line" ]] && report+="🧩 Инфра: ${infra_line}"$'\n'
     [[ -n "$fleet_line$infra_line" ]] && report+=$'\n'
     report+="<tg-emoji emoji-id=\"5296588050640420683\">🕘</tg-emoji> $(msk_date '+%Y-%m-%d %H:%M') МСК"$'\n'"<i>Выборка: ${sample_line}, промахи перепроверены</i>"$'\n'
 
     # Сводка поднята сразу под заголовок и в НЕразворачиваемой цитате -
     # главное видно без единого клика, детали (кто именно и где) остаются
     # ниже по тем же сворачиваемым блокам, что и раньше.
-    local summary_block="📊 <b>RIPE Atlas · флот</b>"$'\n'
+    local summary_block="📊 <b>Сводка</b>"$'\n'
     if [[ "$fleet_total" -gt 0 ]]; then
         # "Без учёта инфры" явно проговариваем: зонды инфра-серверов сюда не
         # входят (у инфры отдельный вердикт по порогу TSPU_INFRA_OK_THRESHOLD).
-        summary_block+="• Ответ TLS (сертификат или alert): <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
-        summary_block+="• Серверов с признаками фильтрации: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
+        summary_block+="• Доступность по флоту: <b>$(( fleet_ok * 100 / fleet_total ))%</b> (${fleet_ok} из ${fleet_total} зондов)${infra_list:+ — без учёта инфры}"$'\n'
+        summary_block+="• Серверов с блокировками: <b>${blocked_n} из ${measured}</b> ($(( blocked_n * 100 / measured ))%)"$'\n'
         if [[ "$city_n" -gt 0 ]]; then
-            summary_block+="• Городов с признаками фильтрации: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
+            summary_block+="• Городов с блокировками: <b>${hit_cities} из ${city_n}</b> ($(( hit_cities * 100 / city_n ))%)"$'\n'
         fi
     else
         # Ни одного удавшегося замера: показывать 100% доступности здесь было
         # бы прямой ложью.
-        summary_block+="• Ответ TLS (сертификат или alert): <b>нет данных</b>"$'\n'
+        summary_block+="• Доступность по флоту: <b>нет данных</b>"$'\n'
     fi
     local mobile_measured=$(( mobile_ok_n + mobile_blocked_n ))
     if [[ "$mobile_measured" -gt 0 ]]; then
-        summary_block+="• Мобильная сеть: <b>${mobile_ok_n} из ${mobile_measured}</b> серверов ответили на TLS"$'\n'
+        summary_block+="• Мобильная сеть: <b>${mobile_ok_n} из ${mobile_measured}</b> серверов доступно"$'\n'
     fi
     [[ "$skip_n" -gt 0 ]] && summary_block+="• Не удалось померить: <b>${skip_n} из ${total}</b>"$'\n'
     [[ "$excluded_n" -gt 0 ]] && summary_block+="• Исключено из проверки: <b>${excluded_n}</b>"$'\n'
     if [[ -n "$infra_list" ]]; then
         if [[ "$infra_measured" -gt 0 ]]; then
-            summary_block+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> достигли порога ответов TLS"
+            summary_block+="• Инфра: <b>${infra_ok_n} из ${infra_measured}</b> доступно"
             [[ "$infra_skip_n" -gt 0 ]] && summary_block+=" (${infra_skip_n} требует проверки)"
             summary_block+=$'\n'
         else
@@ -1206,14 +1238,18 @@ _skynet_censorcheck_run_and_report() {
     report+=$'\n'"<blockquote>${summary_block}</blockquote>"$'\n'
 
     if [[ -n "$replace_list" ]]; then
-        report+=$'\n'"<blockquote expandable>🔴 <b>RIPE Atlas · проверить отдельно (${replace_n}):</b>"$'\n'"${replace_list}</blockquote>"$'\n'
+        report+=$'\n'"<blockquote expandable>🔴 <b>Под замену (${replace_n}):</b>"$'\n'"${replace_list}</blockquote>"$'\n'
+    fi
+
+    if [[ -n "$ok_list" ]]; then
+        report+="<blockquote expandable><tg-emoji emoji-id=\"5258053251873400722\">✅</tg-emoji> <b>Доступно (${ok_n}):</b>"$'\n'"${ok_list}</blockquote>"$'\n'
     fi
 
     # Инфра - отдельным блоком от основного флота: свой список, свой счётчик,
     # без процентов и городов (см. _skynet_tspu_summarize_server).
     if [[ -n "$infra_list" ]]; then
         local infra_total_n=$(( infra_ok_n + infra_blocked_n + infra_skip_n ))
-        report+=$'\n'"<blockquote expandable>🧩 <b>Ответы TLS по инфре (${infra_total_n}):</b>"$'\n'"${infra_list}</blockquote>"$'\n'
+        report+=$'\n'"<blockquote expandable>🧩 <b>Инфра (${infra_total_n}):</b>"$'\n'"${infra_list}</blockquote>"$'\n'
     fi
 
     # Отдельного списка заблокированных серверов нет: где именно режут -
@@ -1221,7 +1257,7 @@ _skynet_censorcheck_run_and_report() {
     # остаётся только в режиме common, где городов не бывает вовсе и иначе
     # заблокированные серверы просто не попали бы в отчёт.
     if [[ -n "$fail_list" && -z "$geo_list" ]]; then
-        report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> <b>Возможная фильтрация (${blocked_n}):</b>"$'\n'"${fail_list}</blockquote>"$'\n'
+        report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5258190433128834075\">👎</tg-emoji> <b>Заблокировано (${blocked_n}):</b>"$'\n'"${fail_list}</blockquote>"$'\n'
     fi
 
     if [[ -n "$skip_list" ]]; then
@@ -1233,7 +1269,7 @@ _skynet_censorcheck_run_and_report() {
     fi
 
     if [[ -n "$geo_list" ]]; then
-        report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Признаки фильтрации по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
+        report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Блокировки по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
         [[ -n "$clean_list" ]] && report+=$'\n'"<i>Чисто: ${clean_list}</i>"$'\n'
         report+="</blockquote>"$'\n'
     fi
@@ -1243,22 +1279,19 @@ _skynet_censorcheck_run_and_report() {
     # это сигнал с конкретной сети, а не статистика по стране.
     if [[ -n "$mobile_list" ]]; then
         mobile_list="${mobile_list%$'\n'}"
-        report+=$'\n'"<blockquote expandable>📱 <b>Мобильные зонды · ответы TLS:</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
+        report+=$'\n'"<blockquote expandable>📱 <b>Мобильная сеть (${mobile_ok_n} из ${mobile_measured} доступно):</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
     fi
 
-    [[ -n "$metric_rows" ]] && report+=$'\n'"${metric_rows}"$'\n'
-    if [[ "${TSPU_POSTQ_CHECKER:-0}" != 1 ]]; then
-        report+="<i>Xray Checker (РФ) выключен</i>"$'\n'
-    fi
+    [[ -n "$checker_report" ]] && report+=$'\n'"${checker_report}"$'\n'
 
     if [[ "$send_tg" -eq 0 ]]; then
-        log "CensorCheck: проверка из панели (${total} серверов, ${blocked_n} с признаками фильтрации, ${skip_n} пропущено, ${excluded_n} исключено), Telegram не настроен - отчёт не отправлен."
+        log "CensorCheck: проверка из панели (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено), Telegram не настроен - отчёт не отправлен."
         return 0
     fi
 
     if _skynet_censorcheck_tg_send "$report"; then
-        [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} с признаками фильтрации, ${skip_n} пропущено, ${excluded_n} исключено)."
-        log "CensorCheck: отчёт отправлен (${total} серверов, ${blocked_n} с признаками фильтрации, ${skip_n} пропущено, ${excluded_n} исключено)."
+        [[ "$verbose" -eq 1 ]] && printf_ok "Отчёт отправлен в Telegram (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено)."
+        log "CensorCheck: отчёт отправлен (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено)."
         return 0
     else
         [[ "$verbose" -eq 1 ]] && printf_error "Не удалось отправить отчёт в Telegram."
@@ -1333,8 +1366,9 @@ _skynet_censorcheck_check_address() {
 
     local probes_out; probes_out=$(_skynet_tspu_py probes "$RIPE_API_KEY" 2>/dev/null)
     if [[ "$probes_out" != OK\ * ]]; then
-        printf_warning "Выборка Atlas пока недоступна. Локальные проверки выполнятся отдельно."
-        probes_out="OK 0 0"
+        printf_error "Не удалось собрать выборку зондов RIPE Atlas (${probes_out:-нет ответа})."
+        wait_for_enter
+        return
     fi
     local _p probe_n city_n
     read -r _p probe_n city_n <<< "$(echo "$probes_out" | head -1)"
@@ -1351,8 +1385,6 @@ _skynet_censorcheck_check_address() {
     local tmp_dir; tmp_dir=$(mktemp -d)
     printf '1\t%s\n' "$ip" > "${tmp_dir}/.targets"
     _skynet_tspu_py fleet "$RIPE_API_KEY" "$sni" "${tmp_dir}/.targets" "$tmp_dir" >/dev/null 2>&1
-    printf '%s (%s)\n' "$target" "$ip" > "${tmp_dir}/1.name"
-    _skynet_tspu_fetch_vpn_status "$tmp_dir"
     _skynet_tspu_summarize_server "$tmp_dir" 1 > "${tmp_dir}/1.result"
 
     local -A asn_titles=()
@@ -1367,8 +1399,16 @@ _skynet_censorcheck_check_address() {
     [[ "$detail" == "$result" ]] && detail=""
 
     echo ""
-    printf_description "${target} — $(python3 "$_TSPU_STORE_SCRIPT" metrics "${tmp_dir}/1.out")"
-    [[ -n "$detail" ]] && printf_description "RIPE Atlas — ${detail}"
+    case "$kind" in
+        AVAILABLE) printf_ok "${target}: доступен из сетей РФ${detail:+ (${detail})}" ;;
+        BLOCKED)   printf_warning "${target}: блокировка — ${detail}" ;;
+        *)         printf_warning "${target}: не удалось померить — ${detail}" ;;
+    esac
+    if [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]]; then
+        _skynet_tspu_fetch_vpn_status "$tmp_dir"
+        printf '%s (%s)\n' "$target" "$ip" > "$tmp_dir/1.name"
+        python3 "$_TSPU_STORE_SCRIPT" checker-one "$tmp_dir"
+    fi
     log "CensorCheck: ручная проверка ${target} (${ip}, SNI ${sni}) — ${result} [$(head -1 "${tmp_dir}/1.out" 2>/dev/null)]"
 
     # Города и мобильная сеть - в том же виде, что раздел географии отчёта,
@@ -1860,8 +1900,8 @@ _skynet_censorcheck_fleet_thresholds_menu() {
         printf_menu_option "2" "«Под замену»: блокировка минимум в ${C_GREEN}${share}%${C_RESET} городов"
         printf_menu_option "3" "«Под замену»: средняя доступность по ним ниже ${C_GREEN}${avg}%${C_RESET}"
         echo ""
-        printf_description "Строка «Флот» в отчёте: ⚪ нет данных · 🟢 признаков фильтрации не найдено ·"
-        printf_description "🟡 есть признаки фильтрации (меньше порога [1]) · 🔴 порог [1] достигнут."
+        printf_description "Строка «Флот» в отчёте: ⚪ нет данных · 🟢 всё чисто ·"
+        printf_description "🟡 есть блокировки (меньше порога [1]) · 🔴 порог [1] достигнут."
         printf_description "В «Под замену» сервер попадает, только если выполнены [2] и [3] сразу."
         echo ""
         printf_menu_option "d" "Сбросить пороги флота к умолчаниям (50 / 50 / 55)"
@@ -2017,9 +2057,6 @@ _skynet_censorcheck_menu() {
         local checker_action="Включить"
         [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] && checker_action="Выключить"
         printf_menu_option "x" "${checker_action} VPN-замер из России (status.postq.space)"
-        local vps_action="Включить"
-        [[ "${TSPU_LOCAL_RU_VPS:-0}" == 1 ]] && vps_action="Выключить"
-        printf_menu_option "v" "${vps_action} TLS-замер с этого сервера (российский VPS)"
         printf_menu_option "g" "Режим проверки, выборка зондов и цена прогона"
         printf_menu_option "s" "Серверы в проверке (включить/исключить)"
         printf_menu_option "e" "Расписание проверок (добавить/убрать время)"
@@ -2040,19 +2077,6 @@ _skynet_censorcheck_menu() {
                 [[ "${TSPU_POSTQ_CHECKER:-0}" == 1 ]] && checker_enabled=0
                 if set_config_var TSPU_POSTQ_CHECKER "$checker_enabled"; then
                     TSPU_POSTQ_CHECKER="$checker_enabled"
-                else
-                    printf_error "Не удалось сохранить настройку."
-                    wait_for_enter
-                fi
-                ;;
-            [vV])
-                local enabled=0
-                if [[ "${TSPU_LOCAL_RU_VPS:-0}" != 1 ]]; then
-                    ask_yes_no "Этот сервер находится в России и будет выполнять TLS-замеры?" "n" || continue
-                    enabled=1
-                fi
-                if set_config_var TSPU_LOCAL_RU_VPS "$enabled"; then
-                    TSPU_LOCAL_RU_VPS="$enabled"
                 else
                     printf_error "Не удалось сохранить настройку."
                     wait_for_enter

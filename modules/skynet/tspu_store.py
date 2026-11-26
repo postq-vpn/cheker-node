@@ -27,9 +27,10 @@
 # Хранилище прогонов: <store_dir>/runs/<id>.json и <store_dir>/last.json,
 # в истории не больше KEEP_RUNS последних прогонов.
 
+import html
+import re
 import json
 import os
-import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -102,34 +103,6 @@ def _asn_list(field):
     return out
 
 
-def parse_metrics(lines):
-    metrics = {
-        "server": "UNKNOWN", "tcpPercent": None, "tcpOk": None, "tcpAttempts": None,
-        "atlasTlsPercent": None, "atlasTlsOk": None, "atlasTlsTotal": None,
-        "ruVpsTls": "NOT_MEASURED", "tspu": "UNKNOWN", "vpn": "NOT_MEASURED",
-    }
-    for line in lines:
-        parts = line.split()
-        if len(parts) == 3 and parts[0] in ("TCP", "ATLAS_TLS"):
-            ok, total = (_int(v) for v in parts[1:])
-            if total > 0 and 0 <= ok <= total:
-                tcp = parts[0] == "TCP"
-                metrics["tcpOk" if tcp else "atlasTlsOk"] = ok
-                metrics["tcpAttempts" if tcp else "atlasTlsTotal"] = total
-                metrics["tcpPercent" if tcp else "atlasTlsPercent"] = ok * 100 // total
-                if ok:
-                    metrics["server"] = "AVAILABLE"
-        elif line == "ATLAS_REACHED" or line == "RU_TLS AVAILABLE":
-            metrics["server"] = "AVAILABLE"
-        if len(parts) == 2 and parts[0] == "RU_TLS":
-            metrics["ruVpsTls"] = parts[1]
-        if len(parts) >= 4 and parts[0] == "OK":
-            ok, total = _int(parts[2]), _int(parts[3])
-            if total:
-                metrics["tspu"] = "NO_SIGNS" if ok == total else "SUSPECTED FILTERING"
-    return metrics
-
-
 def vpn_observation(snapshot, hosts):
     try:
         data = json.loads(snapshot)
@@ -158,49 +131,15 @@ def vpn_observation(snapshot, hosts):
             "vpnCheckedAt": checked.isoformat(), "vpnProfile": matches[0]["subdomain"]}
 
 
-def server_metrics(raw_path, lines):
-    metrics = parse_metrics(lines)
-    snapshot_path = os.path.join(os.path.dirname(raw_path), ".vpn-status")
-    if os.path.exists(snapshot_path):
-        label = _read(os.path.splitext(raw_path)[0] + ".name").strip()
-        name, _, address = label.rpartition(" (")
-        metrics.update(vpn_observation(_read(snapshot_path), [name, address.rstrip(")")]))
-    return metrics
-
-
-def format_metrics(server, fleet=False):
-    metrics = server["metrics"]
-    labels = {"available": "признаков фильтрации нет", "blocked": "возможна фильтрация"}
-    if server["category"] == "infra":
-        labels = {"available": "доля ответов в пределах порога", "blocked": "доля ответов ниже порога"}
-    verdict = labels.get(server["atlasStatus"], "нет результата")
-    lines = [f"RIPE Atlas — {verdict}"]
-    if server["probesTotal"]:
-        lines.append(f"Ответ TLS с учётом перепроверок — {server['probesOk']}/{server['probesTotal']} ({server['percent']}%)")
-    ok, total = metrics["atlasTlsOk"], metrics["atlasTlsTotal"]
-    if total is None:
-        lines.append("RIPE Atlas · TLS — нет данных")
-    elif ok == 0:
-        lines.append(f"⚠️ RIPE Atlas · TLS не подтверждён (0/{total} зондов получили сертификат)")
-    else:
-        lines.append(f"RIPE Atlas · сертификат получили {ok}/{total} зондов ({metrics['atlasTlsPercent']}%)")
-    vpn = metrics["vpn"]
-    if vpn != "NOT_MEASURED":
-        labels = {"AVAILABLE": "профиль прошёл проверку", "FAILED": "проверка профиля не прошла",
-                  "SOURCE_ERROR": "нет данных", "STALE": "замер устарел",
-                  "NO_PROFILE": "нет профиля", "UNKNOWN": "нет однозначного результата"}
-        checker = f"Xray Checker (РФ) — {labels[vpn]}"
-        if metrics.get("vpnCheckedAt"):
-            checked = datetime.fromisoformat(metrics["vpnCheckedAt"])
-            checker += checked.astimezone(timezone(timedelta(hours=3))).strftime(" · %d.%m %H:%M МСК")
-        lines.append(checker)
-    elif not fleet:
-        lines.append("VPN — требуется отдельный замер")
-    vps = metrics["ruVpsTls"]
-    if not fleet or vps != "NOT_MEASURED":
-        result = {"AVAILABLE": "рукопожатие прошло", "UNAVAILABLE": "соединение не установлено"}.get(vps, "нет замера")
-        lines.append(f"TLS с российского VPS — {result}")
-    return "\n".join(lines)
+def checker_label(metrics):
+    labels = {"AVAILABLE": "профиль прошёл проверку", "FAILED": "проверка профиля не прошла",
+              "SOURCE_ERROR": "нет данных от Checker", "STALE": "замер устарел",
+              "NO_PROFILE": "нет профиля", "UNKNOWN": "нет однозначного результата"}
+    label = labels[metrics["vpn"]]
+    if metrics.get("vpnCheckedAt"):
+        checked = datetime.fromisoformat(metrics["vpnCheckedAt"])
+        label += checked.astimezone(timezone(timedelta(hours=3))).strftime(" · %d.%m %H:%M МСК")
+    return label
 
 
 def parse_server(tmp_dir, idx):
@@ -218,15 +157,12 @@ def parse_server(tmp_dir, idx):
     kind, _, detail = head.partition(" ")
     status = {"AVAILABLE": "available", "BLOCKED": "blocked"}.get(kind, "skipped")
 
-    metrics = server_metrics(os.path.join(tmp_dir, f"{idx}.out"), raw_lines)
     server = {
         "name": name,
         "ip": ip,
         "category": category,
         "sni": _read(os.path.join(tmp_dir, f"{idx}.sni")).strip() or None,
-        "status": metrics["server"].lower(),
-        "atlasStatus": status,
-        "metrics": metrics,
+        "status": status,
         "detail": detail.strip(),
         "percent": None,
         "probesOk": None,
@@ -285,6 +221,9 @@ def parse_server(tmp_dir, idx):
             "first": cols[4],
             "retry": cols[5],
         })
+    snapshot = os.path.join(tmp_dir, ".vpn-status")
+    if os.path.isfile(snapshot):
+        server["metrics"] = vpn_observation(_read(snapshot), [name, ip])
     return server
 
 
@@ -293,15 +232,13 @@ def _summary(servers, excluded):
     infra = [s for s in servers if s["category"] == "infra"]
 
     def count(group, status):
-        return sum(1 for s in group if s["atlasStatus"] == status)
+        return sum(1 for s in group if s["status"] == status)
 
     probes_ok = sum(s["probesOk"] or 0 for s in fleet if s["probesTotal"])
     probes_total = sum(s["probesTotal"] or 0 for s in fleet if s["probesTotal"])
     return {
         "fleet": {
             "total": len(fleet),
-            "serverAvailable": sum(s["status"] == "available" for s in fleet),
-            "suspectedFiltering": sum(s["metrics"]["tspu"] == "SUSPECTED FILTERING" for s in fleet),
             "available": count(fleet, "available"),
             "blocked": count(fleet, "blocked"),
             "skipped": count(fleet, "skipped"),
@@ -311,8 +248,6 @@ def _summary(servers, excluded):
         },
         "infra": {
             "total": len(infra),
-            "serverAvailable": sum(s["status"] == "available" for s in infra),
-            "suspectedFiltering": sum(s["metrics"]["tspu"] == "SUSPECTED FILTERING" for s in infra),
             "available": count(infra, "available"),
             "blocked": count(infra, "blocked"),
             "skipped": count(infra, "skipped"),
@@ -399,10 +334,18 @@ def cmd_check(tmp_dir, out_file, probes_file, asn_file, started, target, ip, sni
 
 def main():
     args = sys.argv[1:]
-    if len(args) == 2 and args[0] in ("metrics", "fleet-metrics"):
-        directory, filename = os.path.split(args[1])
-        server = parse_server(directory, os.path.splitext(filename)[0])
-        print(format_metrics(server, fleet=args[0] == "fleet-metrics"))
+    if len(args) == 2 and args[0] == "checker-report":
+        servers, _ = _collect(args[1])
+        fleet = [s for s in servers if s["category"] != "infra" and "metrics" in s]
+        if fleet:
+            print("<b>Xray Checker · VPN из России</b>")
+            for server in fleet:
+                print(f"• {html.escape(server['name'], quote=False)} — {checker_label(server['metrics'])}")
+        return 0
+    if len(args) == 2 and args[0] == "checker-one":
+        server = parse_server(args[1], 1)
+        if "metrics" in server:
+            print("Xray Checker (РФ) — " + checker_label(server["metrics"]))
         return 0
     if len(args) == 7 and args[0] == "run":
         cmd_run(*args[1:])
