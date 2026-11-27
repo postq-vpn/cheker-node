@@ -65,6 +65,9 @@ _deploy_release() {
         return 1
     fi
     run_cmd rm -rf "$old_dir"
+    if [[ ! -f /etc/cron.d/reshala-ai ]] || grep -Fxq '17 6 * * * root /bin/bash /opt/reshala/reshala.sh ai-monitor run' /etc/cron.d/reshala-ai; then
+        install -m 644 "$INSTALL_DIR/static/cron/reshala-ai" /etc/cron.d/reshala-ai
+    fi
 }
 
 _perform_install_or_update() {
@@ -162,7 +165,7 @@ uninstall_script() {
     warn "Удалить Решалу? Будут удалены все её файлы."
     if ! ask_yes_no "(y/n): " "n"; then info "Удаление отменено."; return; fi
     info "Начинаю удаление (исполняемый файл, каталог /opt/reshala, журнал и база флота)..."
-    run_cmd rm -f "$INSTALL_PATH"
+    run_cmd rm -f "$INSTALL_PATH" /etc/cron.d/reshala-ai
     run_cmd rm -rf "/opt/reshala"
     # Сносим лог и базу флота, если есть
     if [ -n "${LOGFILE:-}" ]; then run_cmd rm -f "$LOGFILE" 2>/dev/null || true; fi

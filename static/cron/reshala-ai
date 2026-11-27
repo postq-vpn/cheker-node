@@ -1,0 +1,3 @@
+# Reshala Skynet · IPv4
+AI_TIME=09:00
+* * * * * root [ "$(TZ=Europe/Moscow date +\%H:\%M)" = "$AI_TIME" ] && /bin/bash /opt/reshala/reshala.sh ai-monitor run
