@@ -27,7 +27,6 @@
 # Хранилище прогонов: <store_dir>/runs/<id>.json и <store_dir>/last.json,
 # в истории не больше KEEP_RUNS последних прогонов.
 
-import html
 import re
 import json
 import os
@@ -338,9 +337,27 @@ def main():
         servers, _ = _collect(args[1])
         fleet = [s for s in servers if s["category"] != "infra" and "metrics" in s]
         if fleet:
-            print("<b>Xray Checker · VPN из России</b>")
-            for server in fleet:
-                print(f"• {html.escape(server['name'], quote=False)} — {checker_label(server['metrics'])}")
+            statuses = [s["metrics"]["vpn"] for s in fleet]
+            available = statuses.count("AVAILABLE")
+            failed = statuses.count("FAILED")
+            unknown = len(fleet) - available - failed
+            if failed > 3:
+                emoji = "🔴"
+            elif failed:
+                emoji = "🟡"
+            elif unknown:
+                emoji = "⚪"
+            else:
+                emoji = "🟢"
+            if available == len(fleet):
+                summary = "все доступны"
+            elif unknown == len(fleet):
+                summary = "нет свежих данных"
+            else:
+                summary = f"доступны {available} из {len(fleet)}"
+                if unknown:
+                    summary += f" · без данных: {unknown}"
+            print(f"{emoji} <b>Xray Checker · VPN-серверы</b> — {summary}")
         return 0
     if len(args) == 2 and args[0] == "checker-one":
         server = parse_server(args[1], 1)

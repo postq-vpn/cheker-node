@@ -1195,7 +1195,9 @@ _skynet_censorcheck_run_and_report() {
         verdict_emoji="🟡"; verdict_text="блокировок не найдено, не всё проверено"
     fi
 
-    local report="${verdict_emoji} <b>Блокировка ТСПУ — ${verdict_text}</b>"$'\n\n'
+    local report=""
+    [[ -n "$checker_report" ]] && report="${checker_report}"$'\n\n'
+    report+="${verdict_emoji} <b>Блокировка ТСПУ — ${verdict_text}</b>"$'\n\n'
     [[ -n "$fleet_line" ]] && report+="🖥 Флот: ${fleet_line}"$'\n'
     [[ -n "$infra_line" ]] && report+="🧩 Инфра: ${infra_line}"$'\n'
     [[ -n "$fleet_line$infra_line" ]] && report+=$'\n'
@@ -1264,10 +1266,6 @@ _skynet_censorcheck_run_and_report() {
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5242222002420346059\">⬇️</tg-emoji> <b>Требуют проверки (${skip_n}):</b>"$'\n'"${skip_list}</blockquote>"$'\n'
     fi
 
-    if [[ -n "$excluded_list" ]]; then
-        report+=$'\n'"<blockquote expandable>🚫 <b>Исключены из проверки (${excluded_n}):</b>"$'\n'"${excluded_list}</blockquote>"$'\n'
-    fi
-
     if [[ -n "$geo_list" ]]; then
         report+=$'\n'"<blockquote expandable><tg-emoji emoji-id=\"5240241223632954241\">🌍</tg-emoji> <b>Блокировки по городам (${hit_cities}):</b>"$'\n'"${geo_list}"
         [[ -n "$clean_list" ]] && report+=$'\n'"<i>Чисто: ${clean_list}</i>"$'\n'
@@ -1282,7 +1280,9 @@ _skynet_censorcheck_run_and_report() {
         report+=$'\n'"<blockquote expandable>📱 <b>Мобильная сеть (${mobile_ok_n} из ${mobile_measured} доступно):</b>"$'\n'"<i>${mobile_where}</i>"$'\n'"${mobile_list}</blockquote>"$'\n'
     fi
 
-    [[ -n "$checker_report" ]] && report+=$'\n'"${checker_report}"$'\n'
+    if [[ -n "$excluded_list" ]]; then
+        report+=$'\n'"<blockquote expandable>🚫 <b>Исключены из проверки (${excluded_n}):</b>"$'\n'"${excluded_list}</blockquote>"$'\n'
+    fi
 
     if [[ "$send_tg" -eq 0 ]]; then
         log "CensorCheck: проверка из панели (${total} серверов, ${blocked_n} заблокировано, ${skip_n} пропущено, ${excluded_n} исключено), Telegram не настроен - отчёт не отправлен."
