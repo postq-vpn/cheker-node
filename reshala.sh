@@ -26,7 +26,7 @@ export SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 # что приводит к "chdir: error: getcwd: cannot access parent directories"
 cd "$SCRIPT_DIR" 2>/dev/null || cd / || true
 
-readonly VERSION="v3.195"
+readonly VERSION="v3.197"
 
 # ============================================================ #
 #              ПОДГОТОВКА И ЗАГРУЗКА КОМПОНЕНТОВ               #
@@ -317,6 +317,11 @@ main() {
         exit 0
     fi
 
+    if [[ "${1:-}" == "ai-monitor" ]]; then
+        run_module skynet/ai_monitor _skynet_ai_main "${2:-run}"
+        exit $?
+    fi
+
     # Headless-запуск из cron: проверка "Блокировка ТСПУ" по всему флоту
     # с отчётом в Telegram, без выхода в интерактивное меню.
     if [[ "${1:-}" == "censorcheck-report" ]]; then
@@ -345,6 +350,12 @@ main() {
     if [[ "${1:-}" == "fleet-capacity" ]]; then
         run_module skynet/capacity _skynet_capacity_auto_run
         exit $?
+    fi
+
+    # При первом обновлении замену файлов выполняет ещё прежний установщик.
+    if [[ "$SCRIPT_DIR" == /opt/reshala ]] && { [[ ! -e /etc/cron.d/reshala-ai ]] ||
+        grep -Fxq '17 6 * * * root /bin/bash /opt/reshala/reshala.sh ai-monitor run' /etc/cron.d/reshala-ai; }; then
+        run_module skynet/ai_monitor _skynet_ai_main enable || log "IPRegion: не удалось включить расписание"
     fi
 
     log "Запуск фреймворка Решала ${VERSION}"
